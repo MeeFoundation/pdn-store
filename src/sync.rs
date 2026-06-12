@@ -51,6 +51,14 @@ pub const MAX_TIMESTAMP_FUTURE_SHIFT: u64 = 10 * 60 * Duration::from_secs(1).as_
 pub type ContentStatusCallback =
     Arc<dyn Fn(Hash) -> n0_future::boxed::BoxFuture<ContentStatus> + Send + Sync + 'static>;
 
+/// Callback that decides whether an incoming entry may be persisted.
+///
+/// Returns `true` to accept the entry, `false` to drop it. It is consulted for
+/// every non-local entry at the [`validate_entry`] chokepoint — i.e. for both
+/// set-reconciliation and live-gossip ingest — and is the injection point for
+/// PdnId / UWill capability checks. `None` keeps vanilla accept-all behaviour.
+pub type CapabilityValidator = Arc<dyn Fn(&SignedEntry) -> bool + Send + Sync + 'static>;
+
 /// Event emitted by sync when entries are added.
 #[derive(derive_more::Debug, Clone)]
 pub enum Event {
@@ -277,6 +285,8 @@ pub struct ReplicaInfo {
     subscribers: Subscribers,
     #[debug("ContentStatusCallback")]
     content_status_cb: Option<ContentStatusCallback>,
+    #[debug("CapabilityValidator")]
+    capability_validator: Option<CapabilityValidator>,
     closed: bool,
 }
 
@@ -288,6 +298,7 @@ impl ReplicaInfo {
             subscribers: Default::default(),
             // on_insert_sender: RwLock::new(None),
             content_status_cb: None,
+            capability_validator: None,
             closed: false,
         }
     }
@@ -324,6 +335,19 @@ impl ReplicaInfo {
             false
         } else {
             self.content_status_cb = Some(cb);
+            true
+        }
+    }
+
+    /// Set the capability validator run on every incoming (non-local) entry.
+    ///
+    /// Only one validator can be active at a time. If a previous one was
+    /// registered, this returns `false` and keeps the existing validator.
+    pub fn set_capability_validator(&mut self, validator: CapabilityValidator) -> bool {
+        if self.capability_validator.is_some() {
+            false
+        } else {
+            self.capability_validator = Some(validator);
             true
         }
     }
@@ -449,7 +473,15 @@ where
         let namespace = self.id();
 
         let store = &self.store;
-        validate_entry(system_time_now(), store, namespace, &entry, &origin)?;
+        // here: same gate (validate_entry) — pass the injected capability validator
+        validate_entry(
+            system_time_now(),
+            store,
+            namespace,
+            &entry,
+            &origin,
+            self.info.capability_validator.as_ref(),
+        )?;
 
         let outcome = self.store.put(entry.clone()).map_err(InsertError::Store)?;
         tracing::debug!(?origin, hash = %entry.content_hash(), ?outcome, "insert");
@@ -537,6 +569,7 @@ where
         // let subscribers = std::rc::Rc::new(&mut self.subscribers);
         // l
         let cb = self.info.content_status_cb.clone();
+        let capability_validator = self.info.capability_validator.clone();
         let download_policy = self
             .store
             .get_download_policy(&my_namespace)
@@ -552,7 +585,16 @@ where
                         from: from_peer,
                         remote_content_status: content_status,
                     };
-                    validate_entry(now, store, my_namespace, entry, &origin).is_ok()
+                    // here: injected capability validator (set-reconciliation ingest path)
+                    validate_entry(
+                        now,
+                        store,
+                        my_namespace,
+                        entry,
+                        &origin,
+                        capability_validator.as_ref(),
+                    )
+                    .is_ok()
                 },
                 // on_insert callback: is called when an entry was actually inserted in the store
                 async |_store, entry, content_status| {
@@ -625,6 +667,7 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     expected_namespace: NamespaceId,
     entry: &SignedEntry,
     origin: &InsertOrigin,
+    validator: Option<&CapabilityValidator>,
 ) -> Result<(), ValidationFailure> {
     // Verify the namespace
     if entry.namespace() != expected_namespace {
@@ -639,6 +682,18 @@ fn validate_entry<S: ranger::Store<SignedEntry> + PublicKeyStore>(
     // Verify that the timestamp of the entry is not too far in the future.
     if entry.timestamp() > now + MAX_TIMESTAMP_FUTURE_SHIFT {
         return Err(ValidationFailure::TooFarInTheFuture);
+    }
+
+    // here: capability-chain check — gate only remote entries, mirroring the
+    // signature check above. `validator` is the injected PdnId / UWill policy;
+    // `None` keeps vanilla accept-all. Both ingest paths (set reconciliation
+    // + live inserts) funnel through this one chokepoint.
+    if !matches!(origin, InsertOrigin::Local) {
+        if let Some(validate) = validator {
+            if !validate(entry) {
+                return Err(ValidationFailure::Unauthorized);
+            }
+        }
     }
     Ok(())
 }
@@ -693,6 +748,9 @@ pub enum ValidationFailure {
     /// Entry has length 0 but not the empty hash, or the empty hash but not length 0.
     #[error("Entry has length 0 but not the empty hash, or the empty hash but not length 0")]
     InvalidEmptyEntry,
+    /// Entry author is not authorized to write to this namespace (capability check failed).
+    #[error("Entry author is not authorized")]
+    Unauthorized,
 }
 
 /// A signed entry.
@@ -2234,7 +2292,7 @@ mod tests {
         // test with actor
         let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
         let author = Author::new(&mut rng);
-        let handle = SyncHandle::spawn(store, None, "test".into());
+        let handle = SyncHandle::spawn(store, None, None, "test".into());
         let author = handle.import_author(author).await?;
         let namespace = NamespaceSecret::new(&mut rng);
         let id = namespace.id();

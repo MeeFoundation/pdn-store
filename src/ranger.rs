@@ -391,6 +391,7 @@ pub trait Store<E: RangeEntry>: Sized {
 
             // Store incoming values
             for (entry, content_status) in values {
+                // here: accept/reject
                 if validate_cb(self, &entry, content_status) {
                     // TODO: Get rid of the clone?
                     let outcome = self.put(entry.clone())?;

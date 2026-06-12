@@ -28,8 +28,9 @@ use crate::{
         fs::{ContentHashesIterator, StoreInstance},
         DownloadPolicy, ImportNamespaceOutcome, Query, Store,
     },
-    Author, AuthorHeads, AuthorId, Capability, ContentStatus, ContentStatusCallback, Event,
-    NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo, SignedEntry, SyncOutcome,
+    Author, AuthorHeads, AuthorId, Capability, CapabilityValidator, ContentStatus,
+    ContentStatusCallback, Event, NamespaceId, NamespaceSecret, PeerIdBytes, Replica, ReplicaInfo,
+    SignedEntry, SyncOutcome,
 };
 
 const ACTION_CAP: usize = 1024;
@@ -268,6 +269,7 @@ impl SyncHandle {
     pub fn spawn(
         store: Store,
         content_status_callback: Option<ContentStatusCallback>,
+        capability_validator: Option<CapabilityValidator>,
         me: String,
     ) -> SyncHandle {
         let metrics = Arc::new(Metrics::default());
@@ -277,6 +279,7 @@ impl SyncHandle {
             states: Default::default(),
             action_rx,
             content_status_callback,
+            capability_validator,
             tasks: Default::default(),
             metrics: metrics.clone(),
         };
@@ -647,6 +650,7 @@ struct Actor {
     states: OpenReplicas,
     action_rx: async_channel::Receiver<Action>,
     content_status_callback: Option<ContentStatusCallback>,
+    capability_validator: Option<CapabilityValidator>,
     tasks: JoinSet<()>,
     metrics: Arc<Metrics>,
 }
@@ -962,6 +966,9 @@ impl Actor {
             if let Some(cb) = &self.content_status_callback {
                 info.set_content_status_callback(Arc::clone(cb));
             }
+            if let Some(validator) = &self.capability_validator {
+                info.set_capability_validator(Arc::clone(validator));
+            }
             Ok(info)
         };
         self.states.open_with(namespace, opts, open_cb)
@@ -1125,7 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn open_close() -> anyhow::Result<()> {
         let store = store::Store::memory();
-        let sync = SyncHandle::spawn(store, None, "foo".into());
+        let sync = SyncHandle::spawn(store, None, None, "foo".into());
         let namespace = NamespaceSecret::new(&mut rand::rng());
         let id = namespace.id();
         sync.import_namespace(namespace.into()).await?;
@@ -1148,7 +1155,7 @@ mod tests {
     #[tokio::test]
     async fn actor_tasks_joinset_drain() -> anyhow::Result<()> {
         let store = store::Store::memory();
-        let sync = SyncHandle::spawn(store, None, "drain".into());
+        let sync = SyncHandle::spawn(store, None, None, "drain".into());
 
         let namespace = NamespaceSecret::new(&mut rand::rng());
         let id = namespace.id();

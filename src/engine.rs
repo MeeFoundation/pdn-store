@@ -23,8 +23,8 @@ pub use self::{
     state::{Origin, SyncReason},
 };
 use crate::{
-    actor::SyncHandle, metrics::Metrics, Author, AuthorId, ContentStatus, ContentStatusCallback,
-    Entry, NamespaceId,
+    actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, ContentStatus,
+    ContentStatusCallback, Entry, NamespaceId,
 };
 
 mod gossip;
@@ -68,6 +68,7 @@ impl Engine {
         downloader: Downloader,
         default_author_storage: DefaultAuthorStorage,
         protect_cb: Option<ProtectCallbackHandler>,
+        capability_validator: Option<CapabilityValidator>,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
@@ -82,7 +83,12 @@ impl Engine {
                 })
             })
         };
-        let sync = SyncHandle::spawn(replica_store, Some(content_status_cb.clone()), me.clone());
+        let sync = SyncHandle::spawn(
+            replica_store,
+            Some(content_status_cb.clone()),
+            capability_validator,
+            me.clone(),
+        );
 
         let sync2 = sync.clone();
         let gc_protect_task = AbortOnDropHandle::new(n0_future::task::spawn(async move {

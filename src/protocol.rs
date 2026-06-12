@@ -11,6 +11,7 @@ use crate::{
     api::DocsApi,
     engine::{DefaultAuthorStorage, Engine, ProtectCallbackHandler},
     store::Store,
+    CapabilityValidator,
 };
 
 #[derive(Default, Debug)]
@@ -41,6 +42,7 @@ impl Docs {
         Builder {
             storage: Storage::Persistent(path),
             protect_cb: None,
+            capability_validator: None,
         }
     }
 
@@ -82,10 +84,12 @@ impl ProtocolHandler for Docs {
 }
 
 /// Builder for the docs protocol.
-#[derive(Debug, Default)]
+#[derive(derive_more::Debug, Default)]
 pub struct Builder {
     storage: Storage,
     protect_cb: Option<ProtectCallbackHandler>,
+    #[debug("CapabilityValidator")]
+    capability_validator: Option<CapabilityValidator>,
 }
 
 impl Builder {
@@ -94,6 +98,16 @@ impl Builder {
     /// See [`ProtectCallbackHandler::new`] for details.
     pub fn protect_handler(mut self, protect_handler: ProtectCallbackHandler) -> Self {
         self.protect_cb = Some(protect_handler);
+        self
+    }
+
+    /// Set a capability validator consulted for every incoming (non-local) entry
+    /// before it is persisted. Returning `false` drops the entry.
+    ///
+    /// This is the injection point for PdnId / UWill capability checks. If
+    /// unset, all entries are accepted (vanilla iroh-docs behaviour).
+    pub fn capability_validator(mut self, validator: CapabilityValidator) -> Self {
+        self.capability_validator = Some(validator);
         self
     }
 
@@ -125,6 +139,7 @@ impl Builder {
             downloader,
             author_store,
             self.protect_cb,
+            self.capability_validator,
         )
         .await?;
         Ok(Docs::new(engine))

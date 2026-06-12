@@ -359,7 +359,7 @@ mod tests {
         let (alice, bob) = tokio::io::duplex(64);
 
         let (mut alice_reader, mut alice_writer) = tokio::io::split(alice);
-        let alice_handle = SyncHandle::spawn(alice_store, None, "alice".to_string());
+        let alice_handle = SyncHandle::spawn(alice_store, None, None, "alice".to_string());
         alice_handle
             .open(namespace.id(), OpenOpts::default().sync())
             .await?;
@@ -377,7 +377,7 @@ mod tests {
         });
 
         let (mut bob_reader, mut bob_writer) = tokio::io::split(bob);
-        let bob_handle = SyncHandle::spawn(bob_store, None, "bob".to_string());
+        let bob_handle = SyncHandle::spawn(bob_store, None, None, "bob".to_string());
         bob_handle
             .open(namespace.id(), OpenOpts::default().sync())
             .await?;
@@ -546,10 +546,10 @@ mod tests {
                 // replicas can be opened only once so close the replicas before spawning the
                 // actors
                 alice_store.close_replica(namespace.id());
-                let alice_handle = SyncHandle::spawn(alice_store, None, "alice".to_string());
+                let alice_handle = SyncHandle::spawn(alice_store, None, None, "alice".to_string());
 
                 bob_store.close_replica(namespace.id());
-                let bob_handle = SyncHandle::spawn(bob_store, None, "bob".to_string());
+                let bob_handle = SyncHandle::spawn(bob_store, None, None, "bob".to_string());
 
                 run_sync(
                     alice_handle.clone(),
@@ -676,8 +676,8 @@ mod tests {
         alice_store.close_replica(namespace.id());
         bob_store.close_replica(namespace.id());
 
-        let alice_handle = SyncHandle::spawn(alice_store, None, "alice".to_string());
-        let bob_handle = SyncHandle::spawn(bob_store, None, "bob".to_string());
+        let alice_handle = SyncHandle::spawn(alice_store, None, None, "alice".to_string());
+        let bob_handle = SyncHandle::spawn(bob_store, None, None, "bob".to_string());
 
         run_sync(
             alice_handle.clone(),
