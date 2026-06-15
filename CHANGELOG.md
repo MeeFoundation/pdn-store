@@ -2,6 +2,16 @@
 
 All notable changes to iroh-docs will be documented in this file.
 
+## [0.101.0](https://github.com/n0-computer/iroh-docs/compare/v0.100.0..0.101.0) - 2026-06-15
+
+### 🐛 Bug Fixes
+
+- *(store)* Migrate redb 2.x tuple tables on open ([#105](https://github.com/n0-computer/iroh-docs/issues/105)) - ([fc89461](https://github.com/n0-computer/iroh-docs/commit/fc894617c449a99580bd2a87a5f55d2fecd21d0f))
+
+### Deps
+
+- Update iroh to 1.0, iroh-blobs to 0.103, iroh-gossip to 0.101 ([#107](https://github.com/n0-computer/iroh-docs/issues/107)) - ([abb3594](https://github.com/n0-computer/iroh-docs/commit/abb3594a23c5e0622a89af067e8bcbe5e384a164))
+
 ## [0.100.0](https://github.com/n0-computer/iroh-docs/compare/v0.99.1..0.100.0) - 2026-05-27
 
 ### ⛰️  Features
