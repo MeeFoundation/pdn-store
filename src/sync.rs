@@ -54,7 +54,7 @@ pub type ContentStatusCallback =
 /// Callback that decides whether an incoming entry may be persisted.
 ///
 /// Returns `true` to accept the entry, `false` to drop it. It is consulted for
-/// every non-local entry at the [`validate_entry`] chokepoint — i.e. for both
+/// every non-local entry at the `validate_entry` chokepoint — i.e. for both
 /// set-reconciliation and live-gossip ingest — and is the injection point for
 /// PdnId / UWill capability checks. `None` keeps vanilla accept-all behaviour.
 pub type CapabilityValidator = Arc<dyn Fn(&SignedEntry) -> bool + Send + Sync + 'static>;

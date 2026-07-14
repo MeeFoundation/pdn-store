@@ -60,6 +60,7 @@ impl Engine {
     ///
     /// This will spawn two tokio tasks for the live sync coordination and gossip actors, and a
     /// thread for the actor interacting with doc storage.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         endpoint: Endpoint,
         gossip: Gossip,
