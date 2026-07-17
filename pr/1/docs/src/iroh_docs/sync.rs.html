@@ -54,7 +54,7 @@
 <a href=#54 id=54 data-nosnippet>54</a><span class="doccomment">/// Callback that decides whether an incoming entry may be persisted.
 <a href=#55 id=55 data-nosnippet>55</a>///
 <a href=#56 id=56 data-nosnippet>56</a>/// Returns `true` to accept the entry, `false` to drop it. It is consulted for
-<a href=#57 id=57 data-nosnippet>57</a>/// every non-local entry at the [`validate_entry`] chokepoint — i.e. for both
+<a href=#57 id=57 data-nosnippet>57</a>/// every non-local entry at the `validate_entry` chokepoint — i.e. for both
 <a href=#58 id=58 data-nosnippet>58</a>/// set-reconciliation and live-gossip ingest — and is the injection point for
 <a href=#59 id=59 data-nosnippet>59</a>/// PdnId / UWill capability checks. `None` keeps vanilla accept-all behaviour.
 <a href=#60 id=60 data-nosnippet>60</a></span><span class="kw">pub type </span>CapabilityValidator = Arc&lt;<span class="kw">dyn </span>Fn(<span class="kw-2">&amp;</span>SignedEntry) -&gt; bool + Send + Sync + <span class="lifetime">'static</span>&gt;;
