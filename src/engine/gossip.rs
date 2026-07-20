@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, instrument, warn};
 
 use super::live::{Op, ToLiveActor};
-use crate::{actor::SyncHandle, ContentStatus, NamespaceId};
+use crate::NamespaceId;
 
 #[derive(Debug)]
 struct ActiveState {
@@ -26,17 +26,15 @@ struct ActiveState {
 #[derive(Debug)]
 pub struct GossipState {
     gossip: Gossip,
-    sync: SyncHandle,
     to_live_actor: mpsc::Sender<ToLiveActor>,
     active: HashMap<NamespaceId, ActiveState>,
     active_tasks: JoinSet<(NamespaceId, Result<()>)>,
 }
 
 impl GossipState {
-    pub fn new(gossip: Gossip, sync: SyncHandle, to_live_actor: mpsc::Sender<ToLiveActor>) -> Self {
+    pub fn new(gossip: Gossip, to_live_actor: mpsc::Sender<ToLiveActor>) -> Self {
         Self {
             gossip,
-            sync,
             to_live_actor,
             active: Default::default(),
             active_tasks: Default::default(),
@@ -58,9 +56,8 @@ impl GossipState {
 
                 let (sender, stream) = sub.split();
                 let to_live_actor = self.to_live_actor.clone();
-                let sync = self.sync.clone();
                 let abort_handle = self.active_tasks.spawn(async move {
-                    let res = receive_loop(namespace, stream, to_live_actor, sync).await;
+                    let res = receive_loop(namespace, stream, to_live_actor).await;
 
                     (namespace, res)
                 });
@@ -84,12 +81,6 @@ impl GossipState {
             state.abort_handle.abort();
         }
         self.progress().await
-    }
-
-    pub async fn broadcast(&mut self, namespace: &NamespaceId, message: Bytes) {
-        if let Some(state) = self.active.get_mut(namespace) {
-            state.sender.broadcast(message).await.ok();
-        }
     }
 
     pub async fn broadcast_neighbors(&mut self, namespace: &NamespaceId, message: Bytes) {
@@ -135,7 +126,6 @@ async fn receive_loop(
     namespace: NamespaceId,
     mut recv: GossipReceiver,
     to_sync_actor: mpsc::Sender<ToLiveActor>,
-    sync: SyncHandle,
 ) -> Result<()> {
     for peer in recv.neighbors() {
         to_sync_actor
@@ -151,25 +141,17 @@ async fn receive_loop(
             Event::Received(msg) => {
                 let op: Op = postcard::from_bytes(&msg.content)?;
                 match op {
-                    Op::Put(entry) => {
-                        debug!(peer = %msg.delivered_from.fmt_short(), namespace = %namespace.fmt_short(), "received entry via gossip");
-                        // Insert the entry into our replica.
-                        // If the message was broadcast with neighbor scope, or is received
-                        // directly from the author, we assume that the content is available at
-                        // that peer. Otherwise we don't.
-                        // The download is not triggered here, but in the `on_replica_event`
-                        // handler for the `InsertRemote` event.
-                        let content_status = match msg.scope.is_direct() {
-                            true => ContentStatus::Complete,
-                            false => ContentStatus::Missing,
-                        };
-                        let from = *msg.delivered_from.as_bytes();
-                        if let Err(err) = sync
-                            .insert_remote(namespace, entry, from, content_status)
-                            .await
-                        {
-                            debug!("ignoring entry received via gossip: {err}");
-                        }
+                    Op::Put(_entry) => {
+                        // Content never rides the topic (content-free
+                        // swarm): entries flow only over reconciliation,
+                        // which the session access provider gates per peer.
+                        // An entry broadcast — from a peer on an older
+                        // build, or a malicious one trying to inject past
+                        // the filter — is dropped, never inserted. Own
+                        // writes announce their author head instead
+                        // (`Op::SyncReport` from `broadcast_local_head`);
+                        // the receiver pulls.
+                        debug!(peer = %msg.delivered_from.fmt_short(), namespace = %namespace.fmt_short(), "dropping entry received via gossip: content does not ride the topic");
                     }
                     Op::ContentReady(hash) => {
                         to_sync_actor

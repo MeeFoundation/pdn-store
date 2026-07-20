@@ -44,6 +44,7 @@ pub mod engine;
 
 pub mod actor;
 pub mod api;
+pub mod filter;
 pub mod store;
 pub mod sync;
 
@@ -54,4 +55,10 @@ mod ranger;
 #[doc(inline)]
 pub use net::ALPN;
 
-pub use self::{heads::*, keys::*, sync::*, ticket::DocTicket};
+pub use self::{
+    filter::{EntryFilter, SessionAccess, SessionAccessFuture, SessionAccessProvider, SessionRole},
+    heads::*,
+    keys::*,
+    sync::*,
+    ticket::DocTicket,
+};

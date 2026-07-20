@@ -448,6 +448,54 @@ async fn sync_open_close() -> Result<()> {
     Ok(())
 }
 
+/// `leave_gossip` is the narrow inverse of the swarm join `start_sync`
+/// performs (downgrading a replica to scoped access): it leaves the topic
+/// and touches nothing else. The live sync stays running, subscribers stay
+/// connected, the replica stays writable, a later `start_sync` re-joins —
+/// and leaving a swarm that was never joined is a no-op, so the call is
+/// idempotent.
+#[tokio::test]
+#[traced_test]
+async fn sync_leave_gossip_keeps_sync_running() -> Result<()> {
+    let mut rng = test_rng(b"sync_leave_gossip_keeps_sync_running");
+    let node = spawn_node(0, &mut rng).await?;
+    let client = node.client();
+
+    let doc = client.docs().create().await?;
+    let author = client.docs().author_create().await?;
+
+    // Leaving the swarm of a doc that never joined one is a no-op.
+    doc.leave_gossip().await?;
+
+    doc.start_sync(vec![]).await?;
+    let sub = doc.subscribe().await?;
+    let status = doc.status().await?;
+    assert!(status.sync);
+    assert_eq!(status.subscribers, 2);
+
+    // Leave the swarm: the live sync keeps running and the subscribers —
+    // the internal one of `start_sync` and ours — stay connected.
+    doc.leave_gossip().await?;
+    let status = doc.status().await?;
+    assert!(status.sync, "leave_gossip must not stop the live sync");
+    assert_eq!(
+        status.subscribers, 2,
+        "leave_gossip must not drop subscribers"
+    );
+
+    // Idempotent, and the replica stays fully usable.
+    doc.leave_gossip().await?;
+    doc.set_bytes(author, b"k".to_vec(), b"v".to_vec()).await?;
+
+    // A later gossip-joining start_sync re-subscribes without error.
+    doc.start_sync(vec![]).await?;
+    let status = doc.status().await?;
+    assert!(status.sync);
+
+    drop(sub);
+    Ok(())
+}
+
 #[tokio::test]
 #[traced_test]
 async fn sync_subscribe_stop_close() -> Result<()> {

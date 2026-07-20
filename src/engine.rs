@@ -70,6 +70,7 @@ impl Engine {
         default_author_storage: DefaultAuthorStorage,
         protect_cb: Option<ProtectCallbackHandler>,
         capability_validator: Option<CapabilityValidator>,
+        session_access: Option<crate::filter::SessionAccessProvider>,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
         let me = endpoint.id().fmt_short().to_string();
@@ -128,6 +129,7 @@ impl Engine {
             downloader,
             to_live_actor_recv,
             live_actor_tx.clone(),
+            session_access,
             sync.metrics().clone(),
         )?;
         let actor_handle = n0_future::task::spawn(
@@ -181,6 +183,31 @@ impl Engine {
             .send(ToLiveActor::StartSync {
                 namespace,
                 peers,
+                join_gossip: true,
+                reply,
+            })
+            .await?;
+        reply_rx.await??;
+        Ok(())
+    }
+
+    /// Start to sync a document without ever joining its gossip swarm.
+    ///
+    /// The scoped-access path: an initial set-reconciliation sync runs with
+    /// each peer, but the node stays outside the replica's swarm —
+    /// reconciliation is its only data path, so it sees updates on its next
+    /// sync, never over gossip.
+    pub async fn start_sync_scoped(
+        &self,
+        namespace: NamespaceId,
+        peers: Vec<EndpointAddr>,
+    ) -> Result<()> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::StartSync {
+                namespace,
+                peers,
+                join_gossip: false,
                 reply,
             })
             .await?;
@@ -200,6 +227,23 @@ impl Engine {
                 kill_subscribers,
                 reply,
             })
+            .await?;
+        reply_rx.await??;
+        Ok(())
+    }
+
+    /// Leave a document's gossip swarm without stopping its live sync.
+    ///
+    /// The narrow inverse of the swarm join that [`Self::start_sync`]
+    /// performs, for downgrading a replica to scoped access: the replica
+    /// stays open and syncing — reconciliation keeps accepting and dialing,
+    /// event subscribers stay live — while the gossip channel closes in
+    /// both directions. Idempotent: leaving a swarm that was never joined
+    /// does nothing. A later [`Self::start_sync`] re-joins.
+    pub async fn leave_gossip(&self, namespace: NamespaceId) -> Result<()> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.to_live_actor
+            .send(ToLiveActor::LeaveGossip { namespace, reply })
             .await?;
         reply_rx.await??;
         Ok(())

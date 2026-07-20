@@ -89,12 +89,17 @@ enum Message {
 }
 
 /// Runs the initiator side of the sync protocol.
+///
+/// `filter` is this side's egress filter for the session: every value this
+/// side reveals — the initial range boundary and fingerprint included —
+/// derives from the filtered view.
 pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut W,
     reader: &mut R,
     handle: &SyncHandle,
     namespace: NamespaceId,
     peer: PublicKey,
+    filter: Option<crate::filter::EntryFilter>,
 ) -> Result<SyncOutcome, ConnectError> {
     let peer_bytes = *peer.as_bytes();
     let mut reader = FramedRead::new(reader, SyncCodec);
@@ -105,7 +110,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     // Init message
 
     let message = handle
-        .sync_initial_message(namespace)
+        .sync_initial_message(namespace, filter.clone())
         .await
         .map_err(ConnectError::sync)?;
     let init_message = Message::Init { namespace, message };
@@ -126,7 +131,13 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                 trace!("recv process message");
                 let current_progress = progress.take().unwrap();
                 let (reply, next_progress) = handle
-                    .sync_process_message(namespace, msg, peer_bytes, current_progress)
+                    .sync_process_message(
+                        namespace,
+                        msg,
+                        peer_bytes,
+                        current_progress,
+                        filter.clone(),
+                    )
                     .await
                     .map_err(ConnectError::sync)?;
                 progress = Some(next_progress);
@@ -175,6 +186,9 @@ pub struct BobState {
     namespace: Option<NamespaceId>,
     peer: PublicKey,
     progress: Option<SyncOutcome>,
+    /// This side's egress filter for the session, taken from the accept
+    /// decision and frozen for the session.
+    filter: Option<crate::filter::EntryFilter>,
 }
 
 impl BobState {
@@ -184,6 +198,7 @@ impl BobState {
             peer,
             namespace: None,
             progress: Some(Default::default()),
+            filter: None,
         }
     }
 
@@ -216,8 +231,9 @@ impl BobState {
                     trace!("recv init message");
                     let accept = accept_cb(namespace, self.peer).await;
                     match accept {
-                        AcceptOutcome::Allow => {
+                        AcceptOutcome::Allow { filter } => {
                             trace!("allow request");
+                            self.filter = filter;
                         }
                         AcceptOutcome::Reject(reason) => {
                             debug!(?reason, "reject request");
@@ -239,6 +255,7 @@ impl BobState {
                             message,
                             *self.peer.as_bytes(),
                             last_progress,
+                            self.filter.clone(),
                         )
                         .await;
                     self.namespace = Some(namespace);
@@ -247,8 +264,14 @@ impl BobState {
                 (Message::Sync(msg), Some(namespace)) => {
                     trace!("recv process message");
                     let last_progress = self.progress.take().unwrap();
-                    sync.sync_process_message(*namespace, msg, *self.peer.as_bytes(), last_progress)
-                        .await
+                    sync.sync_process_message(
+                        *namespace,
+                        msg,
+                        *self.peer.as_bytes(),
+                        last_progress,
+                        self.filter.clone(),
+                    )
+                    .await
                 }
                 (Message::Init { .. }, Some(_)) => {
                     return Err(self.fail(anyhow!("double init message")));
@@ -372,6 +395,7 @@ mod tests {
                 &alice_handle2,
                 namespace_id,
                 bob_peer_id,
+                None,
             )
             .await
         });
@@ -387,7 +411,7 @@ mod tests {
                 &mut bob_writer,
                 &mut bob_reader,
                 bob_handle2,
-                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow),
+                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
                 alice_peer_id,
             )
             .await
@@ -599,6 +623,7 @@ mod tests {
                 &alice_handle,
                 namespace,
                 bob_node_pubkey,
+                None,
             )
             .await
         });
@@ -609,7 +634,7 @@ mod tests {
                 &mut bob_writer,
                 &mut bob_reader,
                 bob_handle,
-                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow),
+                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
                 alice_node_pubkey,
             )
             .await

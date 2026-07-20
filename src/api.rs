@@ -29,9 +29,9 @@ use self::{
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
         GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
-        ImportRequest, LeaveRequest, ListRequest, OpenRequest, SetDownloadPolicyRequest,
-        SetHashRequest, SetRequest, ShareMode, ShareRequest, StartSyncRequest, StatusRequest,
-        SubscribeRequest,
+        ImportRequest, LeaveGossipRequest, LeaveRequest, ListRequest, OpenRequest,
+        SetDownloadPolicyRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest,
+        StartSyncRequest, StatusRequest, SubscribeRequest,
     },
 };
 use crate::{
@@ -100,6 +100,7 @@ impl DocsApi {
                     DocsProtocol::Del(msg) => local.send((msg, tx)).await,
                     DocsProtocol::StartSync(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Leave(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::LeaveGossip(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Share(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Subscribe(msg) => local.send((msg, tx)).await,
                     DocsProtocol::GetDownloadPolicy(msg) => local.send((msg, tx)).await,
@@ -440,6 +441,24 @@ impl Doc {
             .rpc(StartSyncRequest {
                 doc_id: self.namespace_id,
                 peers,
+                join_gossip: true,
+            })
+            .await??;
+        Ok(())
+    }
+
+    /// Starts to sync this document with a list of peers, without ever
+    /// joining the replica's gossip swarm.
+    ///
+    /// The scoped-access path: reconciliation with the given peers is the
+    /// only data path; updates arrive on the next sync, never over gossip.
+    pub async fn start_sync_scoped(&self, peers: Vec<EndpointAddr>) -> Result<()> {
+        self.ensure_open()?;
+        self.inner
+            .rpc(StartSyncRequest {
+                doc_id: self.namespace_id,
+                peers,
+                join_gossip: false,
             })
             .await??;
         Ok(())
@@ -450,6 +469,26 @@ impl Doc {
         self.ensure_open()?;
         self.inner
             .rpc(LeaveRequest {
+                doc_id: self.namespace_id,
+            })
+            .await??;
+        Ok(())
+    }
+
+    /// Leaves this document's gossip swarm without stopping its live sync.
+    ///
+    /// The narrow inverse of the swarm join that [`Self::start_sync`]
+    /// performs, for downgrading a replica to scoped access: the replica
+    /// stays open and syncing — reconciliation keeps accepting and dialing,
+    /// event subscribers stay live — while the gossip channel closes in
+    /// both directions: nothing more is ingested from the topic, and local
+    /// inserts stop broadcasting to it. Idempotent: leaving a swarm that
+    /// was never joined does nothing; a later [`Self::start_sync`]
+    /// re-joins.
+    pub async fn leave_gossip(&self) -> Result<()> {
+        self.ensure_open()?;
+        self.inner
+            .rpc(LeaveGossipRequest {
                 doc_id: self.namespace_id,
             })
             .await??;

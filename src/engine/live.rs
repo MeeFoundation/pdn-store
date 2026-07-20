@@ -61,12 +61,20 @@ pub enum ToLiveActor {
     StartSync {
         namespace: NamespaceId,
         peers: Vec<EndpointAddr>,
+        /// Whether to join the replica's gossip swarm. Scoped access syncs
+        /// without ever joining the swarm.
+        join_gossip: bool,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
     },
     Leave {
         namespace: NamespaceId,
         kill_subscribers: bool,
+        #[debug("onsehot::Sender")]
+        reply: sync::oneshot::Sender<anyhow::Result<()>>,
+    },
+    LeaveGossip {
+        namespace: NamespaceId,
         #[debug("onsehot::Sender")]
         reply: sync::oneshot::Sender<anyhow::Result<()>>,
     },
@@ -185,6 +193,10 @@ pub struct LiveActor {
 
     /// Sync state per replica and peer
     state: NamespaceStates,
+    /// The embedder's per-session access provider: consulted on both
+    /// session roles — accept and dial — to decide what a peer may see of
+    /// a namespace. `None` keeps every session full (vanilla).
+    session_access: Option<crate::filter::SessionAccessProvider>,
     metrics: Arc<Metrics>,
 }
 impl LiveActor {
@@ -198,10 +210,11 @@ impl LiveActor {
         downloader: Downloader,
         inbox: mpsc::Receiver<ToLiveActor>,
         sync_actor_tx: mpsc::Sender<ToLiveActor>,
+        session_access: Option<crate::filter::SessionAccessProvider>,
         metrics: Arc<Metrics>,
     ) -> Result<Self> {
         let (replica_events_tx, replica_events_rx) = async_channel::bounded(1024);
-        let gossip_state = GossipState::new(gossip, sync.clone(), sync_actor_tx.clone());
+        let gossip_state = GossipState::new(gossip, sync_actor_tx.clone());
         let memory_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(memory_lookup.clone());
         Ok(Self {
@@ -224,6 +237,7 @@ impl LiveActor {
             retry_after_failure: Default::default(),
             queued_hashes: Default::default(),
             hash_providers: Default::default(),
+            session_access,
             metrics,
         })
     }
@@ -325,9 +339,10 @@ impl LiveActor {
             ToLiveActor::StartSync {
                 namespace,
                 peers,
+                join_gossip,
                 reply,
             } => {
-                let res = self.start_sync(namespace, peers).await;
+                let res = self.start_sync(namespace, peers, join_gossip).await;
                 reply.send(res).ok();
             }
             ToLiveActor::Leave {
@@ -337,6 +352,10 @@ impl LiveActor {
             } => {
                 let res = self.leave(namespace, kill_subscribers).await;
                 reply.send(res).ok();
+            }
+            ToLiveActor::LeaveGossip { namespace, reply } => {
+                self.leave_gossip(namespace);
+                reply.send(Ok(())).ok();
             }
             ToLiveActor::Subscribe {
                 namespace,
@@ -376,15 +395,42 @@ impl LiveActor {
         let endpoint = self.endpoint.clone();
         let sync = self.sync.clone();
         let metrics = self.metrics.clone();
+        let session_access = self.session_access.clone();
         let fut = async move {
-            let res = connect_and_sync(
-                &endpoint,
-                &sync,
-                namespace,
-                EndpointAddr::new(peer),
-                Some(&metrics),
-            )
-            .await;
+            // The dialing side serves entries too (reconciliation is
+            // bidirectional), so the embedder's access provider gates this
+            // role exactly like the accept role.
+            let access = match &session_access {
+                None => crate::filter::SessionAccess::Full,
+                Some(provider) => provider(namespace, peer, crate::filter::SessionRole::Dial).await,
+            };
+            let res = match access {
+                crate::filter::SessionAccess::Deny => Err(ConnectError::sync(anyhow::anyhow!(
+                    "session denied by the local access provider"
+                ))),
+                crate::filter::SessionAccess::Full => {
+                    connect_and_sync(
+                        &endpoint,
+                        &sync,
+                        namespace,
+                        EndpointAddr::new(peer),
+                        Some(&metrics),
+                        None,
+                    )
+                    .await
+                }
+                crate::filter::SessionAccess::Filtered(filter) => {
+                    connect_and_sync(
+                        &endpoint,
+                        &sync,
+                        namespace,
+                        EndpointAddr::new(peer),
+                        Some(&metrics),
+                        Some(filter),
+                    )
+                    .await
+                }
+            };
             (namespace, peer, reason, res)
         }
         .instrument(Span::current());
@@ -410,8 +456,9 @@ impl LiveActor {
         &mut self,
         namespace: NamespaceId,
         mut peers: Vec<EndpointAddr>,
+        join_gossip: bool,
     ) -> Result<()> {
-        debug!(?namespace, peers = peers.len(), "start sync");
+        debug!(?namespace, peers = peers.len(), join_gossip, "start sync");
         // update state to allow sync
         if !self.state.is_syncing(&namespace) {
             let opts = OpenOpts::default()
@@ -444,7 +491,7 @@ impl LiveActor {
                 warn!(%e, "db error reading peers per document")
             }
         }
-        self.join_peers(namespace, peers).await?;
+        self.join_peers(namespace, peers, join_gossip).await?;
         Ok(())
     }
 
@@ -468,7 +515,27 @@ impl LiveActor {
         Ok(())
     }
 
-    async fn join_peers(&mut self, namespace: NamespaceId, peers: Vec<EndpointAddr>) -> Result<()> {
+    /// Leave the replica's gossip swarm and touch nothing else — the
+    /// narrow inverse of the join `start_sync` performs.
+    ///
+    /// The replica stays open and in the sync set — reconciliation keeps
+    /// accepting and dialing — and event subscribers stay live. Quitting
+    /// drops both halves of the topic subscription (the receive loop is
+    /// aborted, the sender goes with its state), so gossip stops in both
+    /// directions: nothing more is ingested from the topic, and
+    /// broadcasting to it becomes a no-op. A later gossip-joining
+    /// `start_sync` re-subscribes. Idempotent: quitting a topic that was
+    /// never joined does nothing.
+    fn leave_gossip(&mut self, namespace: NamespaceId) {
+        self.gossip.quit(&namespace);
+    }
+
+    async fn join_peers(
+        &mut self,
+        namespace: NamespaceId,
+        peers: Vec<EndpointAddr>,
+        join_gossip: bool,
+    ) -> Result<()> {
         let mut peer_ids = Vec::new();
 
         // add addresses of peers to our endpoint address book
@@ -482,8 +549,12 @@ impl LiveActor {
             peer_ids.push(peer_id);
         }
 
-        // tell gossip to join
-        self.gossip.join(namespace, peer_ids.clone()).await?;
+        // tell gossip to join — unless this is scoped access, which stays
+        // outside the replica's swarm: reconciliation is its only data
+        // path, and the direct syncs below still run.
+        if join_gossip {
+            self.gossip.join(namespace, peer_ids.clone()).await?;
+        }
 
         if !peer_ids.is_empty() {
             // trigger initial sync with initial peers
@@ -687,6 +758,32 @@ impl LiveActor {
             .await;
     }
 
+    /// Announce a locally inserted entry to neighbors as a content-free
+    /// [`SyncReport`] — its author head only, never the entry.
+    ///
+    /// The head is exactly the delta a neighbor needs to see it has news
+    /// ([`AuthorHeads::has_news_for`]) and pull the entry over a classified
+    /// reconciliation; the topic therefore carries digests, not keys, hashes,
+    /// or values. Mirrors the post-sync report path: one hop, cascaded by
+    /// each puller re-announcing to its own neighbors.
+    async fn broadcast_local_head(&mut self, namespace: NamespaceId, entry: &SignedEntry) {
+        let mut author_heads = AuthorHeads::default();
+        author_heads.insert(entry.author_bytes(), entry.timestamp());
+        let heads = match author_heads.encode(Some(self.gossip.max_message_size())) {
+            Ok(heads) => heads,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "Failed to encode author head for local-insert announce"
+                );
+                return;
+            }
+        };
+        let report = SyncReport { namespace, heads };
+        self.broadcast_neighbors(namespace, &Op::SyncReport(report))
+            .await;
+    }
+
     async fn on_download_ready(
         &mut self,
         namespace: NamespaceId,
@@ -762,11 +859,19 @@ impl LiveActor {
         match event {
             crate::Event::LocalInsert { namespace, entry } => {
                 debug!(namespace=%namespace.fmt_short(), "replica event: LocalInsert");
-                // A new entry was inserted locally. Broadcast a gossip message.
+                // A new entry was inserted locally. Announce the new author
+                // head to neighbors — the entry itself never rides the topic
+                // (content-free swarm): a broadcast is relayed by every
+                // member and cannot be filtered per recipient, so gossip
+                // carries only "I have news" and the content flows over the
+                // reconciliation the announce triggers. The announce is one
+                // hop and cascades exactly like the post-sync report below:
+                // a neighbor that pulls the entry re-announces to its own
+                // neighbors, so a whole-topic broadcast (whose relays would
+                // forward the head without holding the content the pull
+                // then asks them for) is deliberately not used.
                 if self.state.is_syncing(&namespace) {
-                    let op = Op::Put(entry.clone());
-                    let message = postcard::to_stdvec(&op)?.into();
-                    self.gossip.broadcast(&namespace, message).await;
+                    self.broadcast_local_head(namespace, &entry).await;
                 }
             }
             crate::Event::RemoteInsert {
@@ -844,8 +949,10 @@ impl LiveActor {
     #[instrument("accept", skip_all)]
     pub async fn handle_connection(&mut self, conn: iroh::endpoint::Connection) {
         let to_actor_tx = self.sync_actor_tx.clone();
+        let session_access = self.session_access.clone();
         let accept_request_cb = move |namespace, peer| {
             let to_actor_tx = to_actor_tx.clone();
+            let session_access = session_access.clone();
             async move {
                 let (reply_tx, reply_rx) = oneshot::channel();
                 to_actor_tx
@@ -856,7 +963,7 @@ impl LiveActor {
                     })
                     .await
                     .ok();
-                match reply_rx.await {
+                let outcome = match reply_rx.await {
                     Ok(outcome) => outcome,
                     Err(err) => {
                         warn!(
@@ -864,6 +971,27 @@ impl LiveActor {
                         );
                         AcceptOutcome::Reject(AbortReason::InternalServerError)
                     }
+                };
+                // Consult the embedder's access provider only after the
+                // engine's own session state allowed the request; a denial
+                // is indistinguishable from the namespace not being hosted.
+                match (outcome, session_access) {
+                    (AcceptOutcome::Allow { .. }, Some(provider)) => {
+                        match provider(namespace, peer, crate::filter::SessionRole::Accept).await {
+                            crate::filter::SessionAccess::Full => {
+                                AcceptOutcome::Allow { filter: None }
+                            }
+                            crate::filter::SessionAccess::Filtered(filter) => {
+                                AcceptOutcome::Allow {
+                                    filter: Some(filter),
+                                }
+                            }
+                            crate::filter::SessionAccess::Deny => {
+                                AcceptOutcome::Reject(AbortReason::NotFound)
+                            }
+                        }
+                    }
+                    (outcome, _) => outcome,
                 }
             }
             .boxed()

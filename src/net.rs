@@ -19,13 +19,17 @@ pub const ALPN: &[u8] = b"/iroh-sync/1";
 
 mod codec;
 
-/// Connect to a peer and sync a replica
+/// Connect to a peer and sync a replica.
+///
+/// `filter` is this side's egress filter for the session: what the dialing
+/// node reveals of its replica to the peer. `None` serves the full view.
 pub async fn connect_and_sync(
     endpoint: &Endpoint,
     sync: &SyncHandle,
     namespace: NamespaceId,
     peer: EndpointAddr,
     metrics: Option<&Metrics>,
+    filter: Option<crate::filter::EntryFilter>,
 ) -> Result<SyncFinished, ConnectError> {
     let t_start = Instant::now();
     let peer_id = peer.id;
@@ -41,7 +45,15 @@ pub async fn connect_and_sync(
     let t_connect = t_start.elapsed();
     debug!(?t_connect, "connected");
 
-    let res = run_alice(&mut send_stream, &mut recv_stream, sync, namespace, peer_id).await;
+    let res = run_alice(
+        &mut send_stream,
+        &mut recv_stream,
+        sync,
+        namespace,
+        peer_id,
+        filter,
+    )
+    .await;
 
     send_stream.finish().map_err(ConnectError::close)?;
     send_stream.stopped().await.map_err(ConnectError::close)?;
@@ -92,12 +104,27 @@ pub async fn connect_and_sync(
 }
 
 /// Whether we want to accept or reject an incoming sync request.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum AcceptOutcome {
     /// Accept the sync request.
-    Allow,
+    Allow {
+        /// This side's egress filter for the session: what the serving
+        /// node reveals of the replica to this peer. `None` serves the
+        /// full view.
+        filter: Option<crate::filter::EntryFilter>,
+    },
     /// Decline the sync request
     Reject(AbortReason),
+}
+
+impl std::fmt::Debug for AcceptOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AcceptOutcome::Allow { filter: None } => write!(f, "Allow"),
+            AcceptOutcome::Allow { filter: Some(_) } => write!(f, "Allow(filtered)"),
+            AcceptOutcome::Reject(reason) => write!(f, "Reject({reason:?})"),
+        }
+    }
 }
 
 /// Handle an iroh-docs connection and sync all shared documents in the replica store.

@@ -540,19 +540,32 @@ where
     }
 
     /// Create the initial message for the set reconciliation flow with a remote peer.
-    pub fn sync_initial_message(&mut self) -> anyhow::Result<crate::ranger::Message<SignedEntry>> {
+    ///
+    /// With a session `filter` set, the initial range boundary and
+    /// fingerprint derive from the filtered view only.
+    pub fn sync_initial_message(
+        &mut self,
+        filter: Option<crate::filter::EntryFilter>,
+    ) -> anyhow::Result<crate::ranger::Message<SignedEntry>> {
         self.info.ensure_open().map_err(anyhow::Error::from)?;
-        self.store.initial_message()
+        crate::filter::SessionStore::new(&mut self.store, filter).initial_message()
     }
 
     /// Process a set reconciliation message from a remote peer.
     ///
     /// Returns the next message to be sent to the peer, if any.
+    ///
+    /// With a session `filter` set, every read this round performs —
+    /// fingerprints, split boundaries, item transmissions — sees only the
+    /// entries the filter admits, so nothing else is revealed to the peer.
+    /// Ingest of the peer's entries is unaffected: writes pass through the
+    /// session store, gated by `validate_entry` alone.
     pub async fn sync_process_message(
         &mut self,
         message: crate::ranger::Message<SignedEntry>,
         from_peer: PeerIdBytes,
         state: &mut SyncOutcome,
+        filter: Option<crate::filter::EntryFilter>,
     ) -> Result<Option<crate::ranger::Message<SignedEntry>>, anyhow::Error> {
         self.info.ensure_open()?;
         let my_namespace = self.id();
@@ -574,8 +587,8 @@ where
             .store
             .get_download_policy(&my_namespace)
             .unwrap_or_default();
-        let reply = self
-            .store
+        let mut session_store = crate::filter::SessionStore::new(&mut self.store, filter);
+        let reply = session_store
             .process_message(
                 &Default::default(),
                 message,
@@ -2361,14 +2374,14 @@ mod tests {
 
         replica1.hash_and_insert(b"foo", &author, b"init").await?;
 
-        let from1 = replica1.sync_initial_message()?;
+        let from1 = replica1.sync_initial_message(None)?;
         let from2 = replica2
-            .sync_process_message(from1, peer1, &mut state2)
+            .sync_process_message(from1, peer1, &mut state2, None)
             .await
             .unwrap()
             .unwrap();
         let from1 = replica1
-            .sync_process_message(from2, peer2, &mut state1)
+            .sync_process_message(from2, peer2, &mut state1, None)
             .await
             .unwrap()
             .unwrap();
@@ -2377,7 +2390,7 @@ mod tests {
         // sure that no InsertRemote event is emitted for this entry.
         replica2.hash_and_insert(b"foo", &author, b"update").await?;
         let from2 = replica2
-            .sync_process_message(from1, peer1, &mut state2)
+            .sync_process_message(from1, peer1, &mut state2, None)
             .await
             .unwrap();
         assert!(from2.is_none());
@@ -2671,18 +2684,18 @@ mod tests {
         let mut alice_state = SyncOutcome::default();
         let mut bob_state = SyncOutcome::default();
         // Sync alice - bob
-        let mut next_to_bob = Some(alice.sync_initial_message()?);
+        let mut next_to_bob = Some(alice.sync_initial_message(None)?);
         let mut rounds = 0;
         while let Some(msg) = next_to_bob.take() {
             assert!(rounds < 100, "too many rounds");
             rounds += 1;
             println!("round {rounds}");
             if let Some(msg) = bob
-                .sync_process_message(msg, alice_peer_id, &mut bob_state)
+                .sync_process_message(msg, alice_peer_id, &mut bob_state, None)
                 .await?
             {
                 next_to_bob = alice
-                    .sync_process_message(msg, bob_peer_id, &mut alice_state)
+                    .sync_process_message(msg, bob_peer_id, &mut alice_state, None)
                     .await?
             }
         }

@@ -15,11 +15,12 @@ use super::{
         CloseResponse, CreateRequest, CreateResponse, DelRequest, DelResponse, DocsMessage,
         DocsProtocol, DropRequest, DropResponse, GetDownloadPolicyRequest,
         GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
-        GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse, LeaveRequest,
-        LeaveResponse, ListRequest, ListResponse, OpenRequest, OpenResponse,
-        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
-        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
-        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
+        GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse,
+        LeaveGossipRequest, LeaveGossipResponse, LeaveRequest, LeaveResponse, ListRequest,
+        ListResponse, OpenRequest, OpenResponse, SetDownloadPolicyRequest,
+        SetDownloadPolicyResponse, SetHashRequest, SetHashResponse, SetRequest, SetResponse,
+        ShareMode, ShareRequest, ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest,
+        StatusResponse, SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -141,6 +142,13 @@ impl RpcActor {
                 let result = self.doc_leave(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send Leave response: {}", e);
+                }
+            }
+            DocsMessage::LeaveGossip(leave_gossip) => {
+                let WithChannels { tx, inner, .. } = leave_gossip;
+                let result = self.doc_leave_gossip(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send LeaveGossip response: {}", e);
                 }
             }
             DocsMessage::Share(share) => {
@@ -466,10 +474,20 @@ impl RpcActor {
         &self,
         req: StartSyncRequest,
     ) -> RpcResult<StartSyncResponse> {
-        let StartSyncRequest { doc_id, peers } = req;
-        self.start_sync(doc_id, peers)
-            .await
-            .map_err(|e| RpcError::new(&*e))?;
+        let StartSyncRequest {
+            doc_id,
+            peers,
+            join_gossip,
+        } = req;
+        if join_gossip {
+            self.start_sync(doc_id, peers)
+                .await
+                .map_err(|e| RpcError::new(&*e))?;
+        } else {
+            self.start_sync_scoped(doc_id, peers)
+                .await
+                .map_err(|e| RpcError::new(&*e))?;
+        }
         Ok(StartSyncResponse {})
     }
 
@@ -479,6 +497,17 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(LeaveResponse {})
+    }
+
+    pub(super) async fn doc_leave_gossip(
+        &self,
+        req: LeaveGossipRequest,
+    ) -> RpcResult<LeaveGossipResponse> {
+        let LeaveGossipRequest { doc_id } = req;
+        self.leave_gossip(doc_id)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(LeaveGossipResponse {})
     }
 
     pub(super) async fn doc_set(&self, req: SetRequest) -> RpcResult<SetResponse> {

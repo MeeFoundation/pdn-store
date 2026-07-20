@@ -43,6 +43,7 @@ impl Docs {
             storage: Storage::Persistent(path),
             protect_cb: None,
             capability_validator: None,
+            session_access_provider: None,
         }
     }
 
@@ -90,6 +91,8 @@ pub struct Builder {
     protect_cb: Option<ProtectCallbackHandler>,
     #[debug("CapabilityValidator")]
     capability_validator: Option<CapabilityValidator>,
+    #[debug("SessionAccessProvider")]
+    session_access_provider: Option<crate::filter::SessionAccessProvider>,
 }
 
 impl Builder {
@@ -108,6 +111,20 @@ impl Builder {
     /// unset, all entries are accepted (vanilla iroh-docs behaviour).
     pub fn capability_validator(mut self, validator: CapabilityValidator) -> Self {
         self.capability_validator = Some(validator);
+        self
+    }
+
+    /// Set a per-session access provider consulted on both session roles —
+    /// accepting a sync request and dialing out — to decide what a peer may
+    /// see of a namespace.
+    ///
+    /// If unset, every session serves the full replica (vanilla iroh-docs
+    /// behaviour).
+    pub fn session_access_provider(
+        mut self,
+        provider: crate::filter::SessionAccessProvider,
+    ) -> Self {
+        self.session_access_provider = Some(provider);
         self
     }
 
@@ -140,6 +157,7 @@ impl Builder {
             author_store,
             self.protect_cb,
             self.capability_validator,
+            self.session_access_provider,
         )
         .await?;
         Ok(Docs::new(engine))

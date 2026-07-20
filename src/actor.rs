@@ -149,6 +149,8 @@ enum ReplicaAction {
         reply: oneshot::Sender<Result<()>>,
     },
     SyncInitialMessage {
+        #[debug("filter")]
+        filter: Option<crate::filter::EntryFilter>,
         #[debug("reply")]
         reply: oneshot::Sender<Result<Message<SignedEntry>>>,
     },
@@ -156,6 +158,8 @@ enum ReplicaAction {
         message: Message<SignedEntry>,
         from: PeerIdBytes,
         state: SyncOutcome,
+        #[debug("filter")]
+        filter: Option<crate::filter::EntryFilter>,
         #[debug("reply")]
         reply: oneshot::Sender<Result<(Option<Message<SignedEntry>>, SyncOutcome)>>,
     },
@@ -410,9 +414,10 @@ impl SyncHandle {
     pub async fn sync_initial_message(
         &self,
         namespace: NamespaceId,
+        filter: Option<crate::filter::EntryFilter>,
     ) -> Result<Message<SignedEntry>> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::SyncInitialMessage { reply };
+        let action = ReplicaAction::SyncInitialMessage { filter, reply };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -423,6 +428,7 @@ impl SyncHandle {
         message: Message<SignedEntry>,
         from: PeerIdBytes,
         state: SyncOutcome,
+        filter: Option<crate::filter::EntryFilter>,
     ) -> Result<(Option<Message<SignedEntry>>, SyncOutcome)> {
         let (reply, rx) = oneshot::channel();
         let action = ReplicaAction::SyncProcessMessage {
@@ -430,6 +436,7 @@ impl SyncHandle {
             message,
             from,
             state,
+            filter,
         };
         self.send_replica(namespace, action).await?;
         rx.await?
@@ -857,12 +864,12 @@ impl Actor {
                 .await
             }
 
-            ReplicaAction::SyncInitialMessage { reply } => {
+            ReplicaAction::SyncInitialMessage { filter, reply } => {
                 send_reply_with(reply, self, move |this| {
                     let mut replica = this
                         .states
                         .replica_if_syncing(&namespace, &mut this.store)?;
-                    let res = replica.sync_initial_message()?;
+                    let res = replica.sync_initial_message(filter)?;
                     Ok(res)
                 })
             }
@@ -870,6 +877,7 @@ impl Actor {
                 message,
                 from,
                 mut state,
+                filter,
                 reply,
             } => {
                 let res = async {
@@ -877,7 +885,7 @@ impl Actor {
                         .states
                         .replica_if_syncing(&namespace, &mut self.store)?;
                     let res = replica
-                        .sync_process_message(message, from, &mut state)
+                        .sync_process_message(message, from, &mut state, filter)
                         .await?;
                     Ok((res, state))
                 }

@@ -180,6 +180,14 @@ pub struct DelResponse {
 pub struct StartSyncRequest {
     pub doc_id: NamespaceId,
     pub peers: Vec<EndpointAddr>,
+    /// Whether to join the replica's gossip swarm. Scoped access syncs
+    /// without ever joining the swarm.
+    #[serde(default = "default_join_gossip")]
+    pub join_gossip: bool,
+}
+
+fn default_join_gossip() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -192,6 +200,14 @@ pub struct LeaveRequest {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LeaveResponse;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LeaveGossipRequest {
+    pub doc_id: NamespaceId,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LeaveGossipResponse;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ShareRequest {
@@ -339,6 +355,8 @@ pub enum DocsProtocol {
     StartSync(StartSyncRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<LeaveResponse>>)]
     Leave(LeaveRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<LeaveGossipResponse>>)]
+    LeaveGossip(LeaveGossipRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<ShareResponse>>)]
     Share(ShareRequest),
     #[rpc(tx = mpsc::Sender<RpcResult<SubscribeResponse>>)]

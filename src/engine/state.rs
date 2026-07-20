@@ -246,19 +246,19 @@ impl PeerState {
 
     fn accept_request(&mut self, me: &EndpointId, node: &EndpointId) -> AcceptOutcome {
         let outcome = match &self.state {
-            SyncState::Idle => AcceptOutcome::Allow,
+            SyncState::Idle => AcceptOutcome::Allow { filter: None },
             SyncState::Running { origin, .. } => match origin {
                 Origin::Accept => AcceptOutcome::Reject(AbortReason::AlreadySyncing),
                 // Incoming sync request while we are dialing ourselves.
                 // In this case, compare the binary representations of our and the other node's id
                 // to deterministically decide which of the two concurrent connections will succeed.
                 Origin::Connect(_reason) => match expected_sync_direction(me, node) {
-                    SyncDirection::Accept => AcceptOutcome::Allow,
+                    SyncDirection::Accept => AcceptOutcome::Allow { filter: None },
                     SyncDirection::Connect => AcceptOutcome::Reject(AbortReason::AlreadySyncing),
                 },
             },
         };
-        if let AcceptOutcome::Allow = outcome {
+        if let AcceptOutcome::Allow { .. } = outcome {
             self.set_sync_running(Origin::Accept);
         }
         outcome
@@ -362,7 +362,7 @@ mod tests {
 
         assert!(states.start_connect(&namespace, node, SyncReason::DirectJoin));
         let outcome = states.accept_request(&me, &namespace, node);
-        assert!(matches!(outcome, AcceptOutcome::Allow));
+        assert!(matches!(outcome, AcceptOutcome::Allow { .. }));
 
         // Our dial comes back rejected; the slot now belongs to the accept exchange.
         assert!(!states.abort_connect(&namespace, node, SyncReason::DirectJoin));
