@@ -29,7 +29,7 @@ use self::{
         AuthorGetDefaultRequest, AuthorImportRequest, AuthorListRequest, AuthorSetDefaultRequest,
         CloseRequest, CreateRequest, DelRequest, DocsProtocol, DropRequest,
         GetDownloadPolicyRequest, GetExactRequest, GetManyRequest, GetSyncPeersRequest,
-        ImportRequest, LeaveGossipRequest, LeaveRequest, ListRequest, OpenRequest,
+        ImportRequest, LeaveGossipRequest, LeaveRequest, ListRequest, OpenRequest, RetractRequest,
         SetDownloadPolicyRequest, SetHashRequest, SetRequest, ShareMode, ShareRequest,
         StartSyncRequest, StatusRequest, SubscribeRequest,
     },
@@ -98,6 +98,7 @@ impl DocsApi {
                     // DocsProtocol::ImportFile(msg) => local.send((msg, tx)).await,
                     // DocsProtocol::ExportFile(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Del(msg) => local.send((msg, tx)).await,
+                    DocsProtocol::Retract(msg) => local.send((msg, tx)).await,
                     DocsProtocol::StartSync(msg) => local.send((msg, tx)).await,
                     DocsProtocol::Leave(msg) => local.send((msg, tx)).await,
                     DocsProtocol::LeaveGossip(msg) => local.send((msg, tx)).await,
@@ -362,6 +363,33 @@ impl Doc {
                 doc_id: self.namespace_id,
                 author_id,
                 prefix: prefix.into(),
+            })
+            .await??;
+        Ok(response.removed)
+    }
+
+    /// Physically removes the record of `author_id` at `key`, if its
+    /// timestamp is at or below `up_to_timestamp` — the local retraction of
+    /// a provisional write.
+    ///
+    /// Removal only: unlike [`del`](Self::del) nothing is inserted, so no
+    /// tombstone replicates and this replica's set simply shrinks; a
+    /// matching entry can re-arrive over a later sync session unless its
+    /// ingest is refused. Returns whether a record was removed.
+    pub async fn retract(
+        &self,
+        author_id: AuthorId,
+        key: impl Into<Bytes>,
+        up_to_timestamp: u64,
+    ) -> Result<bool> {
+        self.ensure_open()?;
+        let response = self
+            .inner
+            .rpc(RetractRequest {
+                doc_id: self.namespace_id,
+                author_id,
+                key: key.into(),
+                up_to_timestamp,
             })
             .await??;
         Ok(response.removed)

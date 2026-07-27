@@ -498,6 +498,38 @@ impl Store {
         )
     }
 
+    /// Physically remove the record of `author` at `key` in `namespace`, if
+    /// its timestamp is at or below `up_to_timestamp` — the local retraction
+    /// of a provisional write. Removal only: nothing is inserted, so no
+    /// tombstone replicates and the set simply shrinks; a matching entry
+    /// can re-arrive over a later sync session unless its ingest is
+    /// refused. The `latest_per_author` hint is deliberately left in place:
+    /// a head pointing at a removed record costs at most one no-news
+    /// reconciliation round. Returns whether a record was removed.
+    pub fn retract_entry(
+        &mut self,
+        namespace: NamespaceId,
+        author: AuthorId,
+        key: &[u8],
+        up_to_timestamp: u64,
+    ) -> Result<bool> {
+        self.modify(|tables| {
+            let records_id = (&namespace.to_bytes(), &author.to_bytes(), key);
+            let timestamp = match tables.records.get(records_id)? {
+                Some(value) => value.value().0,
+                None => return Ok(false),
+            };
+            if timestamp > up_to_timestamp {
+                return Ok(false);
+            }
+            tables.records.remove(records_id)?;
+            tables
+                .records_by_key
+                .remove((&namespace.to_bytes(), key, &author.to_bytes()))?;
+            Ok(true)
+        })
+    }
+
     /// Get all content hashes of all replicas in the store.
     pub fn content_hashes(&mut self) -> Result<ContentHashesIterator> {
         let tables = self.snapshot_owned()?;

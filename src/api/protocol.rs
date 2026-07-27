@@ -177,6 +177,20 @@ pub struct DelResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetractRequest {
+    pub doc_id: NamespaceId,
+    pub author_id: AuthorId,
+    pub key: Bytes,
+    /// Remove only a record whose timestamp is at or below this bound.
+    pub up_to_timestamp: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RetractResponse {
+    pub removed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StartSyncRequest {
     pub doc_id: NamespaceId,
     pub peers: Vec<EndpointAddr>,
@@ -351,6 +365,8 @@ pub enum DocsProtocol {
     // ExportFile(ExportFileRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<DelResponse>>)]
     Del(DelRequest),
+    #[rpc(tx = oneshot::Sender<RpcResult<RetractResponse>>)]
+    Retract(RetractRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<StartSyncResponse>>)]
     StartSync(StartSyncRequest),
     #[rpc(tx = oneshot::Sender<RpcResult<LeaveResponse>>)]

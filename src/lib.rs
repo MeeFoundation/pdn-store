@@ -59,6 +59,7 @@ pub use self::{
     filter::{EntryFilter, SessionAccess, SessionAccessFuture, SessionAccessProvider, SessionRole},
     heads::*,
     keys::*,
+    ranger::ValidateOutcome,
     sync::*,
     ticket::DocTicket,
 };

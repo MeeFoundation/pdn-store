@@ -43,6 +43,7 @@ impl Docs {
             storage: Storage::Persistent(path),
             protect_cb: None,
             capability_validator: None,
+            rejection_observer: None,
             session_access_provider: None,
         }
     }
@@ -91,6 +92,8 @@ pub struct Builder {
     protect_cb: Option<ProtectCallbackHandler>,
     #[debug("CapabilityValidator")]
     capability_validator: Option<CapabilityValidator>,
+    #[debug("RejectionObserver")]
+    rejection_observer: Option<crate::RejectionObserver>,
     #[debug("SessionAccessProvider")]
     session_access_provider: Option<crate::filter::SessionAccessProvider>,
 }
@@ -111,6 +114,16 @@ impl Builder {
     /// unset, all entries are accepted (vanilla iroh-docs behaviour).
     pub fn capability_validator(mut self, validator: CapabilityValidator) -> Self {
         self.capability_validator = Some(validator);
+        self
+    }
+
+    /// Set an observer called for every rejection a replica on this node
+    /// receives — an own entry a peer refused at its ingest gate, echoed back
+    /// in-band on the reconciliation reply.
+    ///
+    /// If unset, nothing is observed.
+    pub fn rejection_observer(mut self, observer: crate::RejectionObserver) -> Self {
+        self.rejection_observer = Some(observer);
         self
     }
 
@@ -157,6 +170,7 @@ impl Builder {
             author_store,
             self.protect_cb,
             self.capability_validator,
+            self.rejection_observer,
             self.session_access_provider,
         )
         .await?;

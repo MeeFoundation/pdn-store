@@ -17,10 +17,10 @@ use super::{
         GetDownloadPolicyResponse, GetExactRequest, GetExactResponse, GetManyRequest,
         GetSyncPeersRequest, GetSyncPeersResponse, ImportRequest, ImportResponse,
         LeaveGossipRequest, LeaveGossipResponse, LeaveRequest, LeaveResponse, ListRequest,
-        ListResponse, OpenRequest, OpenResponse, SetDownloadPolicyRequest,
-        SetDownloadPolicyResponse, SetHashRequest, SetHashResponse, SetRequest, SetResponse,
-        ShareMode, ShareRequest, ShareResponse, StartSyncRequest, StartSyncResponse, StatusRequest,
-        StatusResponse, SubscribeRequest, SubscribeResponse,
+        ListResponse, OpenRequest, OpenResponse, RetractRequest, RetractResponse,
+        SetDownloadPolicyRequest, SetDownloadPolicyResponse, SetHashRequest, SetHashResponse,
+        SetRequest, SetResponse, ShareMode, ShareRequest, ShareResponse, StartSyncRequest,
+        StartSyncResponse, StatusRequest, StatusResponse, SubscribeRequest, SubscribeResponse,
     },
     DocsApi, RpcError, RpcResult,
 };
@@ -128,6 +128,13 @@ impl RpcActor {
                 let result = self.doc_del(inner).await;
                 if let Err(e) = tx.send(result).await {
                     error!("Failed to send Del response: {}", e);
+                }
+            }
+            DocsMessage::Retract(retract) => {
+                let WithChannels { tx, inner, .. } = retract;
+                let result = self.doc_retract(inner).await;
+                if let Err(e) = tx.send(result).await {
+                    error!("Failed to send Retract response: {}", e);
                 }
             }
             DocsMessage::StartSync(start_sync) => {
@@ -549,6 +556,21 @@ impl RpcActor {
             .await
             .map_err(|e| RpcError::new(&*e))?;
         Ok(DelResponse { removed })
+    }
+
+    pub(super) async fn doc_retract(&self, req: RetractRequest) -> RpcResult<RetractResponse> {
+        let RetractRequest {
+            doc_id,
+            author_id,
+            key,
+            up_to_timestamp,
+        } = req;
+        let removed = self
+            .sync
+            .retract_entry(doc_id, author_id, key, up_to_timestamp)
+            .await
+            .map_err(|e| RpcError::new(&*e))?;
+        Ok(RetractResponse { removed })
     }
 
     pub(super) async fn doc_set_hash(&self, req: SetHashRequest) -> RpcResult<SetHashResponse> {

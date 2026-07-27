@@ -26,14 +26,36 @@ pub trait RangeEntry: Debug + Clone {
     /// See [`RangeValue`] for details.
     type Value: RangeValue;
 
+    /// The identity echoed back to the sender when this entry is refused at
+    /// ingest ([`ValidateOutcome::Reject`]) — enough for the sender to name
+    /// the entry, no full re-send.
+    type RejectId: Debug + Clone + PartialEq;
+
     /// Get the key for this entry.
     fn key(&self) -> &Self::Key;
 
     /// Get the value for this entry.
     fn value(&self) -> &Self::Value;
 
+    /// The [`RejectId`](Self::RejectId) of this entry.
+    fn reject_id(&self) -> Self::RejectId;
+
     /// Get the fingerprint for this entry.
     fn as_fingerprint(&self) -> Fingerprint;
+}
+
+/// What the ingest predicate decides for one incoming entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidateOutcome {
+    /// Store the entry.
+    Accept,
+    /// Drop the entry silently — a transient failure (bad signature, clock skew).
+    Drop,
+    /// Drop the entry and return its id to the sender — a capability refusal.
+    /// The id travels only for an entry the store would have taken in, so a
+    /// rejection the sender receives states that this store does not hold
+    /// the named entry.
+    Reject,
 }
 
 /// A trait constraining types that are valid entry keys.
@@ -166,6 +188,14 @@ pub enum MessagePart<E: RangeEntry> {
         deserialize = "RangeItem<E>: Deserialize<'de>"
     ))]
     RangeItem(RangeItem<E>),
+    /// An entry the receiver refused at ingest for lack of a write capability,
+    /// echoed back so the sender can retract it. Carries only the entry's id
+    /// ([`RangeEntry::reject_id`]), never the entry.
+    #[serde(bound(
+        serialize = "E::RejectId: Serialize",
+        deserialize = "E::RejectId: Deserialize<'de>"
+    ))]
+    Rejected(E::RejectId),
 }
 
 impl<E: RangeEntry> MessagePart<E> {
@@ -183,6 +213,15 @@ impl<E: RangeEntry> MessagePart<E> {
         match self {
             MessagePart::RangeFingerprint(_) => None,
             MessagePart::RangeItem(RangeItem { values, .. }) => Some(values),
+            MessagePart::Rejected(_) => None,
+        }
+    }
+
+    /// The rejected-entry id this part carries, if it is a [`Rejected`](Self::Rejected).
+    pub(crate) fn rejected(&self) -> Option<&E::RejectId> {
+        match self {
+            MessagePart::Rejected(id) => Some(id),
+            _ => None,
         }
     }
 }
@@ -330,7 +369,7 @@ pub trait Store<E: RangeEntry>: Sized {
         content_status_cb: F3,
     ) -> Result<Option<Message<E>>, Self::Error>
     where
-        F: Fn(&Self, &E, ContentStatus) -> bool,
+        F: Fn(&Self, &E, ContentStatus) -> ValidateOutcome,
         F2: AsyncFnMut(&Self, E, ContentStatus),
         F3: for<'a> AsyncFn(&'a E) -> ContentStatus,
     {
@@ -347,6 +386,9 @@ pub trait Store<E: RangeEntry>: Sized {
                 MessagePart::RangeFingerprint(fp) => {
                     fingerprints.push(fp);
                 }
+                // Rejections of our own entries: not range data. The caller
+                // surfaces them off the incoming message before processing.
+                MessagePart::Rejected(_) => {}
             }
         }
 
@@ -391,12 +433,26 @@ pub trait Store<E: RangeEntry>: Sized {
 
             // Store incoming values
             for (entry, content_status) in values {
-                // here: accept/reject
-                if validate_cb(self, &entry, content_status) {
-                    // TODO: Get rid of the clone?
-                    let outcome = self.put(entry.clone())?;
-                    if let InsertOutcome::Inserted { .. } = outcome {
-                        on_insert_cb(self, entry, content_status).await;
+                // here: accept / drop / reject-and-notify
+                let outcome = validate_cb(self, &entry, content_status);
+                match outcome {
+                    ValidateOutcome::Accept => {
+                        // TODO: Get rid of the clone?
+                        let insert = self.put(entry.clone())?;
+                        if let InsertOutcome::Inserted { .. } = insert {
+                            on_insert_cb(self, entry, content_status).await;
+                        }
+                    }
+                    ValidateOutcome::Drop => {}
+                    // Echo the id back so the sender can retract it (in-band
+                    // nack) — only for an entry this store would have taken
+                    // in. One it already holds entered under the capability
+                    // that stood when it arrived, and a refusal the sender
+                    // acts on destructively must never name data kept here.
+                    ValidateOutcome::Reject => {
+                        if self.would_insert(&entry)? {
+                            out.push(MessagePart::Rejected(entry.reject_id()));
+                        }
                     }
                 }
             }
@@ -563,17 +619,8 @@ pub trait Store<E: RangeEntry>: Sized {
     /// Returns `true` if the entry was inserted.
     /// Returns `false` if it was not inserted.
     fn put(&mut self, entry: E) -> Result<InsertOutcome, Self::Error> {
-        let prefix_entry = self.prefixes_of(entry.key())?;
-        // First we check if our entry is strictly greater than all parent elements.
-        // From the willow spec:
-        // "Remove all entries whose timestamp is strictly less than the timestamp of any other entry [..]
-        // whose path is a prefix of p." and then "remove all but those whose record has the greatest hash component".
-        // This is the contract of the `Ord` impl for `E::Value`.
-        for prefix_entry in prefix_entry {
-            let prefix_entry = prefix_entry?;
-            if entry.value() <= prefix_entry.value() {
-                return Ok(InsertOutcome::NotInserted);
-            }
+        if !self.would_insert(&entry)? {
+            return Ok(InsertOutcome::NotInserted);
         }
 
         // Now we remove all entries that have our key as a prefix and are older than our entry.
@@ -582,6 +629,24 @@ pub trait Store<E: RangeEntry>: Sized {
         // Insert our new entry.
         self.entry_put(entry)?;
         Ok(InsertOutcome::Inserted { removed })
+    }
+
+    /// Whether [`put`](Self::put) would take `entry` in — the store holds no
+    /// entry that already supersedes it.
+    ///
+    /// From the willow spec: "Remove all entries whose timestamp is strictly
+    /// less than the timestamp of any other entry [..] whose path is a prefix
+    /// of p." and then "remove all but those whose record has the greatest
+    /// hash component". This is the contract of the `Ord` impl for
+    /// `E::Value`, and the set of prefixes includes the entry's own key, so
+    /// an entry this store already holds is not news.
+    fn would_insert(&mut self, entry: &E) -> Result<bool, Self::Error> {
+        for prefix_entry in self.prefixes_of(entry.key())? {
+            if entry.value() <= prefix_entry?.value() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -731,6 +796,7 @@ mod tests {
     {
         type Key = K;
         type Value = V;
+        type RejectId = ();
 
         fn key(&self) -> &Self::Key {
             &self.0
@@ -739,6 +805,8 @@ mod tests {
         fn value(&self) -> &Self::Value {
             &self.1
         }
+
+        fn reject_id(&self) {}
 
         fn as_fingerprint(&self) -> Fingerprint {
             let mut hasher = blake3::Hasher::new();
@@ -1141,14 +1209,14 @@ mod tests {
             let alice_validate_set = alice_validate_set.clone();
             move |_, e, _| {
                 alice_validate_set.borrow_mut().push(*e);
-                false
+                ValidateOutcome::Drop
             }
         });
         let validate_bob: ValidateCb<&str, i32> = Box::new({
             let bob_validate_set = bob_validate_set.clone();
             move |_, e, _| {
                 bob_validate_set.borrow_mut().push(*e);
-                false
+                ValidateOutcome::Drop
             }
         });
 
@@ -1254,19 +1322,23 @@ mod tests {
                         values,
                     );
                 }
+                MessagePart::Rejected(id) => {
+                    println!("  Rejected({id:?})");
+                }
             }
         }
     }
 
-    type ValidateCb<K, V> = Box<dyn Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> bool>;
+    type ValidateCb<K, V> =
+        Box<dyn Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> ValidateOutcome>;
 
     async fn sync<K, V>(alice_set: &[(K, V)], bob_set: &[(K, V)]) -> SyncResult<K, V>
     where
         K: RangeKey + Default,
         V: RangeValue,
     {
-        let alice_validate_cb: ValidateCb<K, V> = Box::new(|_, _, _| true);
-        let bob_validate_cb: ValidateCb<K, V> = Box::new(|_, _, _| true);
+        let alice_validate_cb: ValidateCb<K, V> = Box::new(|_, _, _| ValidateOutcome::Accept);
+        let bob_validate_cb: ValidateCb<K, V> = Box::new(|_, _, _| ValidateOutcome::Accept);
         sync_with_validate_cb_and_assert(alice_set, bob_set, &alice_validate_cb, &bob_validate_cb)
             .await
     }
@@ -1300,8 +1372,8 @@ mod tests {
     where
         K: RangeKey + Default,
         V: RangeValue,
-        F1: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> bool,
-        F2: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> bool,
+        F1: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> ValidateOutcome,
+        F2: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> ValidateOutcome,
     {
         let mut alice = SimpleStore::<K, V>::default();
         let mut bob = SimpleStore::<K, V>::default();
@@ -1399,8 +1471,8 @@ mod tests {
     where
         K: RangeKey + Default,
         V: RangeValue,
-        F1: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> bool,
-        F2: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> bool,
+        F1: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> ValidateOutcome,
+        F2: Fn(&SimpleStore<K, V>, &(K, V), ContentStatus) -> ValidateOutcome,
     {
         let mut alice_to_bob = Vec::new();
         let mut bob_to_alice = Vec::new();

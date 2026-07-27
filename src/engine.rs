@@ -24,7 +24,7 @@ pub use self::{
 };
 use crate::{
     actor::SyncHandle, metrics::Metrics, Author, AuthorId, CapabilityValidator, ContentStatus,
-    ContentStatusCallback, Entry, NamespaceId,
+    ContentStatusCallback, Entry, NamespaceId, RejectionObserver,
 };
 
 mod gossip;
@@ -70,6 +70,7 @@ impl Engine {
         default_author_storage: DefaultAuthorStorage,
         protect_cb: Option<ProtectCallbackHandler>,
         capability_validator: Option<CapabilityValidator>,
+        rejection_observer: Option<RejectionObserver>,
         session_access: Option<crate::filter::SessionAccessProvider>,
     ) -> anyhow::Result<Self> {
         let (live_actor_tx, to_live_actor_recv) = mpsc::channel(ACTOR_CHANNEL_CAP);
@@ -89,6 +90,7 @@ impl Engine {
             replica_store,
             Some(content_status_cb.clone()),
             capability_validator,
+            rejection_observer,
             me.clone(),
         );
 
