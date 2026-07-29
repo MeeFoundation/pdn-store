@@ -93,6 +93,11 @@ enum Message {
 /// `filter` is this side's egress filter for the session: every value this
 /// side reveals — the initial range boundary and fingerprint included —
 /// derives from the filtered view.
+///
+/// The session reads through a store snapshot frozen here, before the
+/// initial message: entries written after this point are not served
+/// within this session (they travel on the next one). The snapshot is
+/// released when this function exits, on every path.
 pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     writer: &mut W,
     reader: &mut R,
@@ -105,12 +110,18 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     let mut reader = FramedRead::new(reader, SyncCodec);
     let mut writer = FramedWrite::new(writer, SyncCodec);
 
-    let mut progress = Some(SyncOutcome::default());
+    let mut progress = SyncOutcome::default();
+
+    // Session setup: the guard holds the egress snapshot until drop.
+    let session = handle
+        .sync_session_start(namespace)
+        .await
+        .map_err(ConnectError::sync)?;
 
     // Init message
 
     let message = handle
-        .sync_initial_message(namespace, filter.clone())
+        .sync_initial_message(namespace, session.id(), filter.clone())
         .await
         .map_err(ConnectError::sync)?;
     let init_message = Message::Init { namespace, message };
@@ -129,18 +140,19 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             Message::Sync(msg) => {
                 trace!("recv process message");
-                let current_progress = progress.take().unwrap();
+                let current_progress = std::mem::take(&mut progress);
                 let (reply, next_progress) = handle
                     .sync_process_message(
                         namespace,
                         msg,
                         peer_bytes,
                         current_progress,
+                        session.id(),
                         filter.clone(),
                     )
                     .await
                     .map_err(ConnectError::sync)?;
-                progress = Some(next_progress);
+                progress = next_progress;
                 if let Some(msg) = reply {
                     trace!("send process message");
                     writer
@@ -158,7 +170,7 @@ pub(super) async fn run_alice<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 
     trace!("done");
-    Ok(progress.unwrap())
+    Ok(progress)
 }
 
 /// Runs the receiver side of the sync protocol.
@@ -183,12 +195,24 @@ where
 
 /// State for the receiver side of the sync protocol.
 pub struct BobState {
+    /// The namespace of an allowed request, set at the accept decision.
+    /// Present without a session for the moment between the decision and
+    /// the session opening, which is why the two are separate fields: an
+    /// error in that moment still has to name the namespace.
     namespace: Option<NamespaceId>,
     peer: PublicKey,
-    progress: Option<SyncOutcome>,
+    /// What the rounds that completed accumulated. A round that fails
+    /// leaves its own counts in the actor, and the outcome of a failed
+    /// exchange is not read.
+    progress: SyncOutcome,
     /// This side's egress filter for the session, taken from the accept
     /// decision and frozen for the session.
     filter: Option<crate::filter::EntryFilter>,
+    /// The session's egress snapshot, opened once the request is allowed
+    /// and released when this state drops — on every session exit path.
+    /// A session carries its own namespace, so the exchange rounds key on
+    /// this alone and cannot read a session-less state as a syncing one.
+    session: Option<crate::actor::SyncSession>,
 }
 
 impl BobState {
@@ -197,8 +221,9 @@ impl BobState {
         Self {
             peer,
             namespace: None,
-            progress: Some(Default::default()),
+            progress: Default::default(),
             filter: None,
+            session: None,
         }
     }
 
@@ -224,7 +249,9 @@ impl BobState {
         let mut writer = FramedWrite::new(writer, SyncCodec);
         while let Some(msg) = reader.next().await {
             let msg = msg.map_err(|e| self.fail(e))?;
-            let next = match (msg, self.namespace.as_ref()) {
+            // Copied out, so the arms can take `self` mutably.
+            let running = self.session.as_ref().map(|s| (s.namespace(), s.id()));
+            let next = match (msg, running) {
                 (Message::Init { namespace, message }, None) => {
                     Span::current()
                         .record("namespace", tracing::field::display(&namespace.fmt_short()));
@@ -234,6 +261,14 @@ impl BobState {
                         AcceptOutcome::Allow { filter } => {
                             trace!("allow request");
                             self.filter = filter;
+                            // Before anything that can fail, because the
+                            // accept decision is where the caller registers
+                            // this pair as exchanging. From here an error
+                            // has to name the namespace, or the caller is
+                            // never told the exchange ended and holds the
+                            // pair for good; a failure before the decision
+                            // names nothing, and rightly.
+                            self.namespace = Some(namespace);
                         }
                         AcceptOutcome::Reject(reason) => {
                             debug!(?reason, "reject request");
@@ -248,27 +283,35 @@ impl BobState {
                             });
                         }
                     }
-                    let last_progress = self.progress.take().unwrap();
-                    let next = sync
-                        .sync_process_message(
-                            namespace,
-                            message,
-                            *self.peer.as_bytes(),
-                            last_progress,
-                            self.filter.clone(),
-                        )
-                        .await;
-                    self.namespace = Some(namespace);
-                    next
-                }
-                (Message::Sync(msg), Some(namespace)) => {
-                    trace!("recv process message");
-                    let last_progress = self.progress.take().unwrap();
+                    // Session setup: freeze the egress snapshot before the
+                    // first message is processed. A rejected request never
+                    // opens one.
+                    let session = sync
+                        .sync_session_start(namespace)
+                        .await
+                        .map_err(|e| self.fail(e))?;
+                    let session_id = session.id();
+                    self.session = Some(session);
+                    let last_progress = std::mem::take(&mut self.progress);
                     sync.sync_process_message(
-                        *namespace,
+                        namespace,
+                        message,
+                        *self.peer.as_bytes(),
+                        last_progress,
+                        session_id,
+                        self.filter.clone(),
+                    )
+                    .await
+                }
+                (Message::Sync(msg), Some((namespace, session_id))) => {
+                    trace!("recv process message");
+                    let last_progress = std::mem::take(&mut self.progress);
+                    sync.sync_process_message(
+                        namespace,
                         msg,
                         *self.peer.as_bytes(),
                         last_progress,
+                        session_id,
                         self.filter.clone(),
                     )
                     .await
@@ -284,7 +327,7 @@ impl BobState {
                 }
             };
             let (reply, progress) = next.map_err(|e| self.fail(e))?;
-            self.progress = Some(progress);
+            self.progress = progress;
             match reply {
                 Some(msg) => {
                     trace!("send process message");
@@ -308,9 +351,10 @@ impl BobState {
         self.namespace
     }
 
-    /// Consume self and get the [`SyncOutcome`] for this connection.
+    /// Consume self and get the [`SyncOutcome`] this connection's completed
+    /// rounds accumulated.
     pub fn into_outcome(self) -> SyncOutcome {
-        self.progress.unwrap()
+        self.progress
     }
 }
 
@@ -608,6 +652,38 @@ mod tests {
         bob_node_pubkey: PublicKey,
         namespace: NamespaceId,
     ) -> Result<()> {
+        let (alice, bob) = run_sync_with_acceptor(
+            alice_handle,
+            alice_node_pubkey,
+            bob_handle,
+            bob_node_pubkey,
+            namespace,
+            |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+        )
+        .await?;
+        alice?;
+        bob?;
+        Ok(())
+    }
+
+    /// Both sides over one duplex, with the acceptor's decision left to the
+    /// caller. Returns each side's own result, so a test can assert about a
+    /// refusal as well as a success.
+    async fn run_sync_with_acceptor<F, Fut>(
+        alice_handle: SyncHandle,
+        alice_node_pubkey: PublicKey,
+        bob_handle: SyncHandle,
+        bob_node_pubkey: PublicKey,
+        namespace: NamespaceId,
+        accept_cb: F,
+    ) -> Result<(
+        Result<SyncOutcome, ConnectError>,
+        Result<(NamespaceId, SyncOutcome), AcceptError>,
+    )>
+    where
+        F: Fn(NamespaceId, PublicKey) -> Fut + Send + 'static,
+        Fut: Future<Output = AcceptOutcome> + Send,
+    {
         alice_handle
             .open(namespace, OpenOpts::default().sync())
             .await?;
@@ -635,15 +711,13 @@ mod tests {
                 &mut bob_writer,
                 &mut bob_reader,
                 bob_handle,
-                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+                accept_cb,
                 alice_node_pubkey,
             )
             .await
         });
 
-        alice_task.await??;
-        bob_task.await??;
-        Ok(())
+        Ok((alice_task.await?, bob_task.await?))
     }
 
     #[tokio::test]
@@ -726,6 +800,438 @@ mod tests {
             vec![(author.id(), key.clone(), hash_bob)]
         );
 
+        Ok(())
+    }
+
+    /// Spawns a handle over a store holding one open-for-sync replica.
+    fn spawn_handle_with_replica(
+        namespace: &NamespaceSecret,
+        me: &str,
+    ) -> Result<(SyncHandle, NamespaceId)> {
+        let mut store = store::Store::memory();
+        store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let handle = SyncHandle::spawn(store, None, None, None, me.to_string());
+        Ok((handle, namespace.id()))
+    }
+
+    /// Both sides of a completed sync exchange release their session
+    /// snapshots.
+    #[tokio::test]
+    async fn test_sync_sessions_released_on_success() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer_id = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer_id = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let (alice_handle, namespace_id) = spawn_handle_with_replica(&namespace, "alice")?;
+        let (bob_handle, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        let (alice, bob) = run_sync_with_acceptor(
+            alice_handle.clone(),
+            alice_peer_id,
+            bob_handle.clone(),
+            bob_peer_id,
+            namespace_id,
+            |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+        )
+        .await?;
+        alice?;
+        bob?;
+
+        // The guards dropped inside the runs; their release messages
+        // precede these probes in the actor queues.
+        assert_eq!(alice_handle.debug_session_count().await?, 0);
+        assert_eq!(bob_handle.debug_session_count().await?, 0);
+
+        alice_handle.shutdown().await?;
+        bob_handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// A rejected request opens no session on the serving side, and the
+    /// dialing side releases its snapshot on the error path.
+    #[tokio::test]
+    async fn test_sync_sessions_released_on_reject() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer_id = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer_id = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let (alice_handle, namespace_id) = spawn_handle_with_replica(&namespace, "alice")?;
+        let (bob_handle, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        let (alice, bob) = run_sync_with_acceptor(
+            alice_handle.clone(),
+            alice_peer_id,
+            bob_handle.clone(),
+            bob_peer_id,
+            namespace_id,
+            |_namespace, _peer| std::future::ready(AcceptOutcome::Reject(AbortReason::NotFound)),
+        )
+        .await?;
+        assert!(alice.is_err());
+        assert!(bob.is_err());
+        assert_eq!(alice_handle.debug_session_count().await?, 0);
+        assert_eq!(bob_handle.debug_session_count().await?, 0);
+
+        alice_handle.shutdown().await?;
+        bob_handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// A cancelled session run releases its snapshot: the guard drops with
+    /// the future.
+    #[tokio::test]
+    async fn test_sync_session_released_on_cancelled_initiator() -> Result<()> {
+        let mut rng = rand::rng();
+        let bob_peer_id = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let (alice_handle, namespace_id) = spawn_handle_with_replica(&namespace, "alice")?;
+        alice_handle
+            .open(namespace_id, OpenOpts::default().sync())
+            .await?;
+
+        // The peer end stays open and silent, so the run parks mid-session.
+        let (alice, _bob_kept_silent) = tokio::io::duplex(64);
+        let (mut alice_reader, mut alice_writer) = tokio::io::split(alice);
+        let alice_handle2 = alice_handle.clone();
+        let alice_task = tokio::task::spawn(async move {
+            run_alice(
+                &mut alice_writer,
+                &mut alice_reader,
+                &alice_handle2,
+                namespace_id,
+                bob_peer_id,
+                None,
+            )
+            .await
+        });
+
+        // Wait until the parked session's snapshot is registered.
+        let mut registered = false;
+        for _ in 0..1000 {
+            if alice_handle.debug_session_count().await? == 1 {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(registered, "session snapshot was never registered");
+
+        alice_task.abort();
+        assert!(alice_task.await.is_err());
+        // The aborted future dropped the guard; its release message
+        // precedes this probe in the actor queue.
+        assert_eq!(alice_handle.debug_session_count().await?, 0);
+
+        alice_handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// A round that fails leaves the accumulated outcome readable.
+    /// `handle_connection` reads it on every path, before it looks at the
+    /// result, so a state left unreadable here panics an accept task — and
+    /// that panic leaves the actor driving every accepted sync, not just
+    /// this connection.
+    /// A session id names the actor that issued it, so one handle refuses
+    /// another's id instead of resolving its own session of that number.
+    ///
+    /// Each actor counts its sessions from zero, so the first session of
+    /// two handles carries the same number by construction — and both
+    /// handles here hold the same namespace, which is the state the
+    /// remaining checks (registered, right namespace) cannot tell apart.
+    #[tokio::test]
+    async fn a_session_id_is_refused_by_a_handle_that_did_not_issue_it() -> Result<()> {
+        let mut rng = rand::rng();
+        let namespace = NamespaceSecret::new(&mut rng);
+
+        let (issuer, namespace_id) = spawn_handle_with_replica(&namespace, "issuer")?;
+        issuer
+            .open(namespace_id, OpenOpts::default().sync())
+            .await?;
+        let (other, _) = spawn_handle_with_replica(&namespace, "other")?;
+        other.open(namespace_id, OpenOpts::default().sync()).await?;
+
+        let session = issuer.sync_session_start(namespace_id).await?;
+        let other_session = other.sync_session_start(namespace_id).await?;
+        assert_eq!(
+            session.id(),
+            session.id(),
+            "an id is stable, so the comparison below is of actors"
+        );
+        assert_ne!(
+            session.id(),
+            other_session.id(),
+            "two actors issued the same id, so nothing distinguishes them"
+        );
+
+        // Authorized: the issuing handle serves it.
+        assert!(issuer
+            .sync_initial_message(namespace_id, session.id(), None)
+            .await
+            .is_ok());
+        // Refused: the other handle holds this namespace and a session of
+        // its own, and still refuses an id it did not issue.
+        assert!(other
+            .sync_initial_message(namespace_id, session.id(), None)
+            .await
+            .is_err());
+
+        drop(session);
+        drop(other_session);
+        issuer.shutdown().await?;
+        other.shutdown().await?;
+        Ok(())
+    }
+
+    /// An accept-side failure names the namespace once the request was
+    /// allowed, and names nothing before that.
+    ///
+    /// The allow is where the caller registers the pair as exchanging, and
+    /// it releases the pair on a result naming both peer and namespace. An
+    /// error that names neither reads as a failure before the first
+    /// message, so the pair is never released and stops syncing for the
+    /// life of the process.
+    #[tokio::test]
+    async fn an_accept_failure_names_the_namespace_it_registered() -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut rng = rand::rng();
+        let peer_id = SecretKey::from_bytes(&[1u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let (handle, namespace_id) = spawn_handle_with_replica(&namespace, "bob")?;
+        // Open, but not for sync: the request is allowed and the session
+        // then refuses — a failure between the two, which is where the
+        // namespace used to be lost.
+        handle.open(namespace_id, OpenOpts::default()).await?;
+
+        let allow = |_ns, _peer| std::future::ready(AcceptOutcome::Allow { filter: None });
+
+        let (bob_side, peer_side) = tokio::io::duplex(1024);
+        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_side);
+        let mut peer_writer = FramedWrite::new(peer_side, SyncCodec);
+        peer_writer
+            .send(super::Message::Init {
+                namespace: namespace_id,
+                message: crate::ranger::Message::from_parts(vec![]),
+            })
+            .await?;
+        drop(peer_writer);
+
+        let mut state = BobState::new(peer_id);
+        let err = state
+            .run(&mut bob_writer, &mut bob_reader, handle.clone(), allow)
+            .await
+            .expect_err("a replica open without sync served a session");
+        assert_eq!(
+            err.namespace(),
+            Some(namespace_id),
+            "the failure did not name the namespace the accept registered"
+        );
+
+        // The tightest case on the other side of the decision: a failure
+        // before it names nothing, so no caller is told to release a pair
+        // it never registered.
+        let (bob_side, mut peer_side) = tokio::io::duplex(1024);
+        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_side);
+        peer_side
+            .write_all(&[0, 0, 0, 4, 0xff, 0xff, 0xff, 0xff])
+            .await?;
+        drop(peer_side);
+
+        let mut state = BobState::new(peer_id);
+        let err = state
+            .run(&mut bob_writer, &mut bob_reader, handle.clone(), allow)
+            .await
+            .expect_err("a malformed first message was accepted");
+        assert_eq!(
+            err.namespace(),
+            None,
+            "a failure before the accept named one"
+        );
+
+        handle.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_handle_never_arrived_is_reclaimed() -> Result<()> {
+        let mut rng = rand::rng();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let (handle, namespace_id) = spawn_handle_with_replica(&namespace, "node")?;
+        handle
+            .open(namespace_id, OpenOpts::default().sync())
+            .await?;
+
+        // A registration whose handle never reached its caller: the
+        // cancellation a session timeout lands between registering the
+        // snapshot and handing the handle back. The lost release message of
+        // a completed session leaves the same state.
+        handle.debug_abandon_session_start(namespace_id).await?;
+
+        let mut reclaimed = false;
+        for _ in 0..200 {
+            if handle.debug_session_count().await? == 0 {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(reclaimed, "the abandoned snapshot was never reclaimed");
+        // The reclaim is counted, so the same event is visible on a running
+        // node and not only from inside this test.
+        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+        assert_eq!(handle.metrics().sync_sessions_open.get(), 0);
+
+        // A session whose handle is alive is not swept out from under it.
+        let session = handle.sync_session_start(namespace_id).await?;
+        tokio::time::sleep(crate::actor::MAX_COMMIT_DELAY * 3).await;
+        assert_eq!(handle.debug_session_count().await?, 1);
+        assert_eq!(handle.metrics().sync_sessions_open.get(), 1);
+        // Held, not reclaimed: the ordinary path leaves this counter alone.
+        assert_eq!(handle.metrics().sync_sessions_reclaimed.get(), 1);
+        assert!(handle
+            .sync_initial_message(namespace_id, session.id(), None)
+            .await
+            .is_ok());
+        drop(session);
+
+        handle.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_round_leaves_the_outcome_readable() -> Result<()> {
+        use crate::{
+            ranger::{Fingerprint, MessagePart, RangeFingerprint},
+            sync::RecordIdentifier,
+            Author,
+        };
+
+        let mut rng = rand::rng();
+        let peer_id = SecretKey::from_bytes(&[1u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let foreign = NamespaceSecret::new(&mut rng);
+        let author = Author::new(&mut rng);
+
+        let (handle, namespace_id) = spawn_handle_with_replica(&namespace, "bob")?;
+        handle
+            .open(namespace_id, OpenOpts::default().sync())
+            .await?;
+
+        // A boundary naming another namespace: the store refuses it, so the
+        // round fails after the state was taken out for the call — the one
+        // window where the state used to be left unreadable.
+        let range = crate::ranger::Range::new(
+            RecordIdentifier::new(foreign.id(), author.id(), b""),
+            RecordIdentifier::new(foreign.id(), author.id(), b"\xff"),
+        );
+        let refused = crate::ranger::Message::from_parts(vec![MessagePart::RangeFingerprint(
+            RangeFingerprint {
+                range,
+                fingerprint: Fingerprint::empty(),
+            },
+        )]);
+
+        let (bob_side, peer_side) = tokio::io::duplex(1024);
+        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_side);
+        // Sent up front and the peer end closed, so an unexpectedly served
+        // round runs into end-of-stream instead of parking the test.
+        let mut peer_writer = FramedWrite::new(peer_side, SyncCodec);
+        // `super::`: this module shadows the wire `Message` with its own alias.
+        peer_writer
+            .send(super::Message::Init {
+                namespace: namespace_id,
+                message: refused,
+            })
+            .await?;
+        drop(peer_writer);
+
+        let mut state = BobState::new(peer_id);
+        let res = state
+            .run(
+                &mut bob_writer,
+                &mut bob_reader,
+                handle.clone(),
+                |_ns, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+            )
+            .await;
+        let err = res.expect_err("the refused range was served");
+        assert!(
+            format!("{err:?}").contains("another namespace"),
+            "the round failed for another reason: {err:?}"
+        );
+
+        // The call `handle_connection` makes on every path.
+        let outcome = state.into_outcome();
+        assert_eq!(outcome.num_sent, 0);
+        assert_eq!(outcome.num_recv, 0);
+
+        handle.shutdown().await?;
+        Ok(())
+    }
+
+    /// Session registry error paths and the replica-close sweep: a session
+    /// requires an open, sync-enabled replica; a session id is bound to
+    /// its namespace; closing the replica reclaims its sessions, and a
+    /// stale id fails instead of silently reading live.
+    #[tokio::test]
+    async fn test_sync_session_lifecycle_errors_and_sweep() -> Result<()> {
+        let mut rng = rand::rng();
+        let ns1 = NamespaceSecret::new(&mut rng);
+        let ns2 = NamespaceSecret::new(&mut rng);
+
+        let mut store = store::Store::memory();
+        store.new_replica(ns1.clone())?;
+        store.close_replica(ns1.id());
+        store.new_replica(ns2.clone())?;
+        store.close_replica(ns2.id());
+        let handle = SyncHandle::spawn(store, None, None, None, "node".to_string());
+
+        // Not open: no session.
+        assert!(handle.sync_session_start(ns1.id()).await.is_err());
+
+        // Open without sync: no session.
+        handle.open(ns1.id(), OpenOpts::default()).await?;
+        assert!(handle.sync_session_start(ns1.id()).await.is_err());
+        handle.close(ns1.id()).await?;
+
+        // Open for sync: session opens and registers.
+        handle.open(ns1.id(), OpenOpts::default().sync()).await?;
+        handle.open(ns2.id(), OpenOpts::default().sync()).await?;
+        let session = handle.sync_session_start(ns1.id()).await?;
+        assert_eq!(handle.debug_session_count().await?, 1);
+
+        // A session id is bound to its namespace.
+        assert!(handle
+            .sync_initial_message(ns2.id(), session.id(), None)
+            .await
+            .is_err());
+        // The bound namespace serves through the snapshot.
+        assert!(handle
+            .sync_initial_message(ns1.id(), session.id(), None)
+            .await
+            .is_ok());
+
+        // Closing the replica sweeps its sessions.
+        handle.close(ns1.id()).await?;
+        assert_eq!(handle.debug_session_count().await?, 0);
+
+        // A stale id fails rather than resolving to whatever now sits at
+        // its number. Reading without a session is not expressible: the id
+        // is a required argument, so no caller can fall back to live reads
+        // by omission.
+        handle.open(ns1.id(), OpenOpts::default().sync()).await?;
+        assert!(handle
+            .sync_initial_message(ns1.id(), session.id(), None)
+            .await
+            .is_err());
+
+        // The guard's late release of the swept session is a no-op.
+        drop(session);
+        assert_eq!(handle.debug_session_count().await?, 0);
+
+        handle.shutdown().await?;
         Ok(())
     }
 }

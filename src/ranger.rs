@@ -245,6 +245,11 @@ impl<E: RangeEntry> Message<E> {
         Ok(Message { parts: vec![part] })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_parts(parts: Vec<MessagePart<E>>) -> Self {
+        Message { parts }
+    }
+
     pub(crate) fn parts(&self) -> &[MessagePart<E>] {
         &self.parts
     }

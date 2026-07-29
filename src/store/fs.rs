@@ -57,6 +57,8 @@ pub struct Store {
     transaction: CurrentTransaction,
     open_replicas: HashSet<NamespaceId>,
     pubkeys: MemPublicKeyStore,
+    #[cfg(test)]
+    commits: usize,
 }
 
 impl Drop for Store {
@@ -162,6 +164,8 @@ impl Store {
             transaction: Default::default(),
             open_replicas: Default::default(),
             pubkeys: Default::default(),
+            #[cfg(test)]
+            commits: 0,
         })
     }
 
@@ -170,9 +174,49 @@ impl Store {
     /// This is the cheapest way to ensure that the data is persisted.
     pub fn flush(&mut self) -> Result<()> {
         if let CurrentTransaction::Write(w) = std::mem::take(&mut self.transaction) {
-            w.commit()?;
+            self.finish_write(w)?;
         }
         Ok(())
+    }
+
+    /// Commit a write transaction, or drop it when nothing was written
+    /// through it.
+    ///
+    /// redb commits durably and has no path that skips the file sync for a
+    /// transaction that changed nothing, so committing a clean one buys a
+    /// sync for nothing. Clean is the ordinary case rather than a rarity:
+    /// reads open a write transaction too ([`Store::tables`]), and every
+    /// sync session opens a snapshot, which flushes. Dropping the
+    /// transaction instead abandons no data — there is none — and leaves
+    /// the same committed state for a reader to see.
+    fn finish_write(&mut self, w: TransactionAndTables) -> Result<()> {
+        if !w.is_dirty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        {
+            self.commits += 1;
+        }
+        w.commit()?;
+        Ok(())
+    }
+
+    /// How many write transactions were actually committed (test
+    /// observability for the clean-transaction skip).
+    #[cfg(test)]
+    pub(crate) fn debug_commit_count(&self) -> usize {
+        self.commits
+    }
+
+    /// Which transaction is currently held, so a test asserting about
+    /// clean commits can show it had one to skip.
+    #[cfg(test)]
+    pub(crate) fn debug_transaction_kind(&self) -> &'static str {
+        match self.transaction {
+            CurrentTransaction::None => "none",
+            CurrentTransaction::Read(_) => "read",
+            CurrentTransaction::Write(_) => "write",
+        }
     }
 
     /// Get a read-only snapshot of the database.
@@ -180,21 +224,20 @@ impl Store {
     /// This has the side effect of committing any open write transaction,
     /// so it can be used as a way to ensure that the data is persisted.
     pub fn snapshot(&mut self) -> Result<&ReadOnlyTables> {
-        let guard = &mut self.transaction;
-        let tables = match std::mem::take(guard) {
+        let tables = match std::mem::take(&mut self.transaction) {
             CurrentTransaction::None => {
                 let tx = self.db.begin_read()?;
                 ReadOnlyTables::new(tx)?
             }
             CurrentTransaction::Write(w) => {
-                w.commit()?;
+                self.finish_write(w)?;
                 let tx = self.db.begin_read()?;
                 ReadOnlyTables::new(tx)?
             }
             CurrentTransaction::Read(tables) => tables,
         };
-        *guard = CurrentTransaction::Read(tables);
-        match &*guard {
+        self.transaction = CurrentTransaction::Read(tables);
+        match &self.transaction {
             CurrentTransaction::Read(ref tables) => Ok(tables),
             _ => unreachable!(),
         }
@@ -227,31 +270,29 @@ impl Store {
     /// As such, there is also no guarantee that the data you see is
     /// already persisted.
     fn tables(&mut self) -> Result<&Tables<'_>> {
-        let guard = &mut self.transaction;
-        let tables = match std::mem::take(guard) {
-            CurrentTransaction::None => {
-                let tx = self.db.begin_write()?;
-                TransactionAndTables::new(tx)?
-            }
-            CurrentTransaction::Write(w) => {
-                if w.since.elapsed() > MAX_COMMIT_DELAY {
-                    tracing::debug!("committing transaction because it's too old");
-                    w.commit()?;
-                    let tx = self.db.begin_write()?;
-                    TransactionAndTables::new(tx)?
-                } else {
-                    w
-                }
-            }
-            CurrentTransaction::Read(_) => {
-                let tx = self.db.begin_write()?;
-                TransactionAndTables::new(tx)?
-            }
-        };
-        *guard = CurrentTransaction::Write(tables);
-        match guard {
+        let tables = self.current_write_transaction()?;
+        self.transaction = CurrentTransaction::Write(tables);
+        match &mut self.transaction {
             CurrentTransaction::Write(ref mut tables) => Ok(tables.tables()),
             _ => unreachable!(),
+        }
+    }
+
+    /// The write transaction to work in: the open one while it is young
+    /// enough, a fresh one otherwise.
+    fn current_write_transaction(&mut self) -> Result<TransactionAndTables> {
+        match std::mem::take(&mut self.transaction) {
+            CurrentTransaction::Write(w) if w.since.elapsed() <= MAX_COMMIT_DELAY => Ok(w),
+            CurrentTransaction::Write(w) => {
+                tracing::debug!("committing transaction because it's too old");
+                self.finish_write(w)?;
+                let tx = self.db.begin_write()?;
+                Ok(TransactionAndTables::new(tx)?)
+            }
+            CurrentTransaction::None | CurrentTransaction::Read(_) => {
+                let tx = self.db.begin_write()?;
+                Ok(TransactionAndTables::new(tx)?)
+            }
         }
     }
 
@@ -264,29 +305,9 @@ impl Store {
     /// To ensure that the data is persisted, acquire a snapshot of the database
     /// or call flush.
     fn modify<T>(&mut self, f: impl FnOnce(&mut Tables) -> Result<T>) -> Result<T> {
-        let guard = &mut self.transaction;
-        let tables = match std::mem::take(guard) {
-            CurrentTransaction::None => {
-                let tx = self.db.begin_write()?;
-                TransactionAndTables::new(tx)?
-            }
-            CurrentTransaction::Write(w) => {
-                if w.since.elapsed() > MAX_COMMIT_DELAY {
-                    tracing::debug!("committing transaction because it's too old");
-                    w.commit()?;
-                    let tx = self.db.begin_write()?;
-                    TransactionAndTables::new(tx)?
-                } else {
-                    w
-                }
-            }
-            CurrentTransaction::Read(_) => {
-                let tx = self.db.begin_write()?;
-                TransactionAndTables::new(tx)?
-            }
-        };
-        *guard = CurrentTransaction::Write(tables);
-        let res = match &mut *guard {
+        let tables = self.current_write_transaction()?;
+        self.transaction = CurrentTransaction::Write(tables);
+        let res = match &mut self.transaction {
             CurrentTransaction::Write(ref mut tables) => tables.with_tables_mut(f)?,
             _ => unreachable!(),
         };
@@ -707,12 +728,71 @@ fn get_exact(
 pub struct StoreInstance<'a> {
     namespace: NamespaceId,
     pub(crate) store: &'a mut Store,
+    /// Frozen read source for one sync session's egress.
+    ///
+    /// When set, the reads that serve the peer — `get_first`, `get_range`,
+    /// and the fingerprints computed from them — come from this snapshot,
+    /// so the served view is stable for the whole session while writes
+    /// continue on the live store. Ingest stays live: `prefixes_of`,
+    /// `entry_put`, and `remove_prefix_filtered` always operate on the
+    /// current state. Two things ride on that. The newer-than comparison
+    /// of `ranger::Store::put` — judged against a stale snapshot, an older
+    /// entry could overwrite a concurrent session's insert. And
+    /// `ranger::Store::would_insert`, the gate on the rejection echoed to
+    /// a sender: judged against the snapshot it would name an entry the
+    /// store took in after session setup, and the sender retracts its own
+    /// copy on that word.
+    pub(crate) session_snapshot: Option<&'a ReadOnlyTables>,
 }
 
 impl<'a> StoreInstance<'a> {
     pub(crate) fn new(namespace: NamespaceId, store: &'a mut Store) -> Self {
-        StoreInstance { namespace, store }
+        StoreInstance {
+            namespace,
+            store,
+            session_snapshot: None,
+        }
     }
+
+    /// The instance a sync session reads through.
+    pub(crate) fn with_session_snapshot(
+        namespace: NamespaceId,
+        store: &'a mut Store,
+        session_snapshot: Option<&'a ReadOnlyTables>,
+    ) -> Self {
+        StoreInstance {
+            namespace,
+            store,
+            session_snapshot,
+        }
+    }
+}
+
+/// The first record in `bounds`, or `None` when the range is empty.
+fn first_record(
+    records: &impl ReadableTable<RecordsId<'static>, RecordsValue<'static>>,
+    bounds: &RecordsBounds,
+) -> Result<Option<RecordIdentifier>> {
+    records
+        .range(bounds.as_ref())?
+        .next_map(|(namespace, author, key), _| RecordIdentifier::new(namespace, author, key))
+        .transpose()
+}
+
+/// The range iterators for `bounds`, plus the wrap-around half when the
+/// range has one. One helper for both sources, so the snapshot and the live
+/// store cannot come to build their ranges differently.
+fn range_pair<'a>(
+    records: &'a impl ReadableTable<RecordsId<'static>, RecordsValue<'static>>,
+    bounds: RecordsBounds,
+    wrap_bounds: Option<RecordsBounds>,
+) -> Result<(RecordsRange<'a>, Option<RecordsRange<'a>>)> {
+    Ok((
+        RecordsRange::with_bounds(records, bounds)?,
+        wrap_bounds
+            .map(|b| RecordsRange::with_bounds(records, b))
+            .transpose()?,
+    ))
 }
 
 impl PublicKeyStore for StoreInstance<'_> {
@@ -740,18 +820,13 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
 
     /// Get a the first key (or the default if none is available).
     fn get_first(&mut self) -> Result<RecordIdentifier> {
-        let tables = self.store.as_mut().tables()?;
         // TODO: verify this fetches all keys with this namespace
         let bounds = RecordsBounds::namespace(self.namespace);
-        let mut records = tables.records.range(bounds.as_ref())?;
-
-        let Some(record) = records.next() else {
-            return Ok(RecordIdentifier::default());
+        let first = match self.session_snapshot {
+            Some(tables) => first_record(&tables.records, &bounds)?,
+            None => first_record(&self.store.as_mut().tables()?.records, &bounds)?,
         };
-        let (compound_key, _value) = record?;
-        let (namespace_id, author_id, key) = compound_key.value();
-        let id = RecordIdentifier::new(namespace_id, author_id, key);
-        Ok(id)
+        Ok(first.unwrap_or_default())
     }
 
     #[cfg(test)]
@@ -825,40 +900,46 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     }
 
     fn get_range(&mut self, range: Range<RecordIdentifier>) -> Result<Self::RangeIterator<'_>> {
-        let tables = self.store.as_mut().tables()?;
-        let iter = match range.x().cmp(range.y()) {
-            // identity range: iter1 = all, iter2 = none
-            Ordering::Equal => {
-                // iterator for all entries in replica
-                let bounds = RecordsBounds::namespace(self.namespace);
-                let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
-                chain_none(iter)
+        let order = range.x().cmp(range.y());
+        // Every namespace's records share one table and these boundaries
+        // arrive from the peer, so an unchecked one scans another
+        // namespace's rows and serves them. Reconciliation derives every
+        // boundary from a key of the replica under exchange, so a foreign
+        // one is a protocol violation rather than a request to narrow. The
+        // identity range (x == y) carries no boundary — it means this
+        // replica whole — and its `x` is the default identifier on an empty
+        // replica, which names no namespace at all.
+        if order != Ordering::Equal {
+            for boundary in [range.x(), range.y()] {
+                anyhow::ensure!(
+                    boundary.namespace() == self.namespace,
+                    "sync range boundary names another namespace"
+                );
             }
-            // regular range: iter1 = x <= t < y, iter2 = none
+        }
+        let (bounds, wrap_bounds) = match order {
+            // identity range: all entries in the replica, no wrap-around
+            Ordering::Equal => (RecordsBounds::namespace(self.namespace), None),
+            // regular range: x <= t < y, no wrap-around
             Ordering::Less => {
-                // iterator for entries from range.x to range.y
                 let start = Bound::Included(range.x().to_byte_tuple());
                 let end = Bound::Excluded(range.y().to_byte_tuple());
-                let bounds = RecordsBounds::new(start, end);
-                let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
-                chain_none(iter)
+                (RecordsBounds::new(start, end), None)
             }
-            // split range: iter1 = start <= t < y, iter2 = x <= t <= end
+            // split range: start <= t < y, then wrap-around x <= t <= end
             Ordering::Greater => {
-                // iterator for entries from start to range.y
                 let end = Bound::Excluded(range.y().to_byte_tuple());
                 let bounds = RecordsBounds::from_start(&self.namespace, end);
-                let iter = RecordsRange::with_bounds(&tables.records, bounds)?;
-
-                // iterator for entries from range.x to end
                 let start = Bound::Included(range.x().to_byte_tuple());
-                let bounds = RecordsBounds::to_end(&self.namespace, start);
-                let iter2 = RecordsRange::with_bounds(&tables.records, bounds)?;
-
-                iter.chain(Some(iter2).into_iter().flatten())
+                let wrap_bounds = RecordsBounds::to_end(&self.namespace, start);
+                (bounds, Some(wrap_bounds))
             }
         };
-        Ok(iter)
+        let (iter, wrap_iter) = match self.session_snapshot {
+            Some(tables) => range_pair(&tables.records, bounds, wrap_bounds)?,
+            None => range_pair(&self.store.as_mut().tables()?.records, bounds, wrap_bounds)?,
+        };
+        Ok(iter.chain(wrap_iter.into_iter().flatten()))
     }
 
     #[cfg(test)]
@@ -920,6 +1001,7 @@ impl<'a> crate::ranger::Store<SignedEntry> for StoreInstance<'a> {
     }
 }
 
+#[cfg(test)]
 fn chain_none<'a, I: Iterator<Item = T> + 'a, T>(
     iter: I,
 ) -> Chain<I, Flatten<std::option::IntoIter<I>>> {

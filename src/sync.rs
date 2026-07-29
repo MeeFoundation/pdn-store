@@ -1922,6 +1922,464 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_snapshot_freezes_egress_memory() -> Result<()> {
+        let alice_store = store::Store::memory();
+        let bob_store = store::Store::memory();
+        test_session_snapshot_freezes_egress(alice_store, bob_store).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn test_session_snapshot_freezes_egress_fs() -> Result<()> {
+        let alice_dbfile = tempfile::NamedTempFile::new()?;
+        let alice_store = store::fs::Store::persistent(alice_dbfile.path())?;
+        let bob_dbfile = tempfile::NamedTempFile::new()?;
+        let bob_store = store::fs::Store::persistent(bob_dbfile.path())?;
+        test_session_snapshot_freezes_egress(alice_store, bob_store).await
+    }
+
+    /// A session serves the store as of session setup: a write landing
+    /// mid-session is not served within the session and travels on the
+    /// next one.
+    async fn test_session_snapshot_freezes_egress(
+        mut alice_store: Store,
+        mut bob_store: Store,
+    ) -> Result<()> {
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let myspace = NamespaceSecret::new(&mut rng);
+        let mut alice = alice_store.new_replica(myspace.clone())?;
+        for el in ["ape", "bee", "cat"] {
+            alice.hash_and_insert(el, &author, el.as_bytes()).await?;
+        }
+        drop(alice);
+
+        // Session setup: freeze alice's egress view.
+        let snapshot = alice_store.snapshot_owned()?;
+        let mut alice = alice_store.new_replica(myspace.clone())?;
+        alice.store.session_snapshot = Some(&snapshot);
+        let mut bob = bob_store.new_replica(myspace.clone())?;
+
+        let first = alice.sync_initial_message(None)?;
+
+        // Lands after session setup: must not be served in this session.
+        alice.hash_and_insert("dog", &author, b"dog").await?;
+
+        let (alice_state, bob_state) = sync_from_initial(&mut alice, &mut bob, first, None).await?;
+        drop(snapshot);
+
+        // The mid-session write was not even transmitted.
+        assert_eq!(alice_state.num_sent, 3);
+        assert_eq!(bob_state.num_recv, 3);
+
+        // The frozen view delivered the pre-session set only.
+        assert_keys(
+            &mut bob_store,
+            myspace.id(),
+            vec![b"ape".to_vec(), b"bee".to_vec(), b"cat".to_vec()],
+        );
+
+        // The next session (fresh snapshot) delivers the held-back write.
+        let snapshot = alice_store.snapshot_owned()?;
+        let mut alice = alice_store.new_replica(myspace.clone())?;
+        alice.store.session_snapshot = Some(&snapshot);
+        let mut bob = bob_store.new_replica(myspace.clone())?;
+        let (alice_state, bob_state) = sync(&mut alice, &mut bob).await?;
+        let _ = (alice_state, bob_state);
+        drop(snapshot);
+        assert_keys(
+            &mut bob_store,
+            myspace.id(),
+            vec![
+                b"ape".to_vec(),
+                b"bee".to_vec(),
+                b"cat".to_vec(),
+                b"dog".to_vec(),
+            ],
+        );
+        alice_store.flush()?;
+        bob_store.flush()?;
+        Ok(())
+    }
+
+    /// Ingest keeps reading the live store under a session snapshot: an
+    /// older remote entry loses against a newer local write the snapshot
+    /// predates. Judged against the snapshot instead, the older entry
+    /// would overwrite the newer one.
+    #[tokio::test]
+    async fn test_session_snapshot_keeps_ingest_reads_live() -> Result<()> {
+        let mut rng = rand::rng();
+        let mut alice_store = store::Store::memory();
+        let mut bob_store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let myspace = NamespaceSecret::new(&mut rng);
+        let key = b"claim";
+
+        let t = system_time_now();
+        let older = SignedEntry::from_parts(&myspace, &author, key, Record::from_data(b"older", t));
+        let newer =
+            SignedEntry::from_parts(&myspace, &author, key, Record::from_data(b"newer", t + 10));
+
+        let mut bob = bob_store.new_replica(myspace.clone())?;
+        bob.insert_entry(older.clone(), InsertOrigin::Local).await?;
+
+        // Alice's snapshot predates her newer write: egress serves nothing
+        // for the key, while the ingest comparison still sees the write.
+        let snapshot = alice_store.snapshot_owned()?;
+        let mut alice = alice_store.new_replica(myspace.clone())?;
+        alice.store.session_snapshot = Some(&snapshot);
+        let first = alice.sync_initial_message(None)?;
+        alice
+            .insert_entry(newer.clone(), InsertOrigin::Local)
+            .await?;
+
+        let (alice_state, bob_state) = sync_from_initial(&mut alice, &mut bob, first, None).await?;
+        drop(snapshot);
+
+        // Bob transmitted the older entry into alice's session; alice's
+        // frozen egress served nothing.
+        assert_eq!(bob_state.num_sent, 1);
+        assert_eq!(alice_state.num_recv, 1);
+        assert_eq!(alice_state.num_sent, 0);
+
+        // The newer local write survived the older remote entry.
+        assert_eq!(
+            get_entry(&mut alice_store, myspace.id(), author.id(), key)?,
+            newer
+        );
+        // The frozen egress did not serve the newer entry: bob holds the
+        // older one until the next session.
+        assert_eq!(
+            get_entry(&mut bob_store, myspace.id(), author.id(), key)?,
+            older
+        );
+
+        // The next session converges bob onto the newer entry.
+        let snapshot = alice_store.snapshot_owned()?;
+        let mut alice = alice_store.new_replica(myspace.clone())?;
+        alice.store.session_snapshot = Some(&snapshot);
+        let mut bob = bob_store.new_replica(myspace.clone())?;
+        let (alice_state, bob_state) = sync(&mut alice, &mut bob).await?;
+        let _ = (alice_state, bob_state);
+        drop(snapshot);
+        assert_eq!(
+            get_entry(&mut bob_store, myspace.id(), author.id(), key)?,
+            newer
+        );
+        alice_store.flush()?;
+        bob_store.flush()?;
+        Ok(())
+    }
+
+    /// A held snapshot's fingerprint does not drift under live writes,
+    /// while the live view and a younger snapshot see them — snapshots
+    /// and the live store read side by side.
+    #[tokio::test]
+    async fn test_session_snapshot_fingerprint_stable_under_live_writes() -> Result<()> {
+        use crate::{ranger::Store as _, store::fs::StoreInstance};
+
+        let mut rng = rand::rng();
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let myspace = NamespaceSecret::new(&mut rng);
+        let ns = myspace.id();
+        let full_range =
+            crate::ranger::Range::new(RecordIdentifier::default(), RecordIdentifier::default());
+
+        let mut replica = store.new_replica(myspace.clone())?;
+        for el in ["ape", "bee"] {
+            replica.hash_and_insert(el, &author, el.as_bytes()).await?;
+        }
+        drop(replica);
+
+        let snap_before = store.snapshot_owned()?;
+        let fp_before = {
+            let mut inst = StoreInstance::new(ns, &mut store);
+            inst.session_snapshot = Some(&snap_before);
+            inst.get_fingerprint(&full_range)?
+        };
+
+        let mut replica = store.new_replica(myspace.clone())?;
+        replica.hash_and_insert("cat", &author, b"cat").await?;
+        drop(replica);
+
+        let fp_frozen = {
+            let mut inst = StoreInstance::new(ns, &mut store);
+            inst.session_snapshot = Some(&snap_before);
+            inst.get_fingerprint(&full_range)?
+        };
+        assert_eq!(fp_before, fp_frozen);
+
+        let snap_after = store.snapshot_owned()?;
+        let fp_live = StoreInstance::new(ns, &mut store).get_fingerprint(&full_range)?;
+        assert_ne!(fp_before, fp_live);
+        let fp_younger = {
+            let mut inst = StoreInstance::new(ns, &mut store);
+            inst.session_snapshot = Some(&snap_after);
+            inst.get_fingerprint(&full_range)?
+        };
+        assert_eq!(fp_live, fp_younger);
+        // The older snapshot still reads unchanged next to the younger one.
+        let fp_older_again = {
+            let mut inst = StoreInstance::new(ns, &mut store);
+            inst.session_snapshot = Some(&snap_before);
+            inst.get_fingerprint(&full_range)?
+        };
+        assert_eq!(fp_before, fp_older_again);
+        store.flush()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_over_an_unwritten_store_commits_nothing_memory() -> Result<()> {
+        let store = store::Store::memory();
+        a_session_over_an_unwritten_store_commits_nothing(store).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn a_session_over_an_unwritten_store_commits_nothing_fs() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let store = store::fs::Store::persistent(dbfile.path())?;
+        a_session_over_an_unwritten_store_commits_nothing(store).await
+    }
+
+    /// Opening a session flushes, and reads open a write transaction of
+    /// their own, so between writes the flush would commit a transaction
+    /// that changed nothing — a durable file sync per session, on the one
+    /// actor thread every replica shares. A transaction nothing was written
+    /// through is dropped instead.
+    async fn a_session_over_an_unwritten_store_commits_nothing(mut store: Store) -> Result<()> {
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let myspace = NamespaceSecret::new(&mut rng);
+        let ns = myspace.id();
+
+        // A write, then a session: the write is committed and served.
+        let mut replica = store.new_replica(myspace.clone())?;
+        replica.hash_and_insert("ape", &author, b"ape").await?;
+        drop(replica);
+        let snapshot = store.snapshot_owned()?;
+        assert_eq!(store.debug_commit_count(), 1);
+        drop(snapshot);
+        assert_keys(&mut store, ns, vec![b"ape".to_vec()]);
+
+        // A read that goes through `tables` leaves a write transaction
+        // open — that is what makes the clean commit the ordinary case —
+        // and a session over it commits nothing.
+        let commits_before = store.debug_commit_count();
+        for _ in 0..5 {
+            store.get_download_policy(&ns)?;
+            assert!(
+                matches!(store.debug_transaction_kind(), "write"),
+                "the read left no write transaction open, so the test proves nothing"
+            );
+            let snapshot = store.snapshot_owned()?;
+            assert_eq!(store.debug_commit_count(), commits_before);
+            drop(snapshot);
+        }
+
+        // A write makes the next session commit again, and the snapshot
+        // serves it — the skip is of an empty commit, not of a real one.
+        let mut replica = store.new_replica(myspace.clone())?;
+        replica.hash_and_insert("bee", &author, b"bee").await?;
+        drop(replica);
+        let snapshot = store.snapshot_owned()?;
+        assert_eq!(store.debug_commit_count(), commits_before + 1);
+        drop(snapshot);
+        assert_keys(&mut store, ns, vec![b"ape".to_vec(), b"bee".to_vec()]);
+        store.flush()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_session_snapshot_commits_pending_write_batch_memory() -> Result<()> {
+        let store = store::Store::memory();
+        test_session_snapshot_commits_pending_write_batch(store).await
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "fs-store")]
+    async fn test_session_snapshot_commits_pending_write_batch_fs() -> Result<()> {
+        let dbfile = tempfile::NamedTempFile::new()?;
+        let store = store::fs::Store::persistent(dbfile.path())?;
+        test_session_snapshot_commits_pending_write_batch(store).await
+    }
+
+    /// Opening a session commits the store's pending write batch
+    /// (`snapshot_owned` flushes): an entry inserted right before session
+    /// setup is in the snapshot, and the store stays writable afterwards
+    /// with the new batch invisible to the held snapshot.
+    async fn test_session_snapshot_commits_pending_write_batch(mut store: Store) -> Result<()> {
+        use crate::{ranger::Store as _, store::fs::StoreInstance};
+
+        let mut rng = rand::rng();
+        let author = Author::new(&mut rng);
+        let myspace = NamespaceSecret::new(&mut rng);
+        let ns = myspace.id();
+        let full_range =
+            crate::ranger::Range::new(RecordIdentifier::default(), RecordIdentifier::default());
+
+        // Sits in the open write batch: nothing flushed it yet.
+        let mut replica = store.new_replica(myspace.clone())?;
+        replica.hash_and_insert("ape", &author, b"ape").await?;
+        drop(replica);
+
+        let snapshot = store.snapshot_owned()?;
+        let keys: Vec<_> = {
+            let mut inst = StoreInstance::new(ns, &mut store);
+            inst.session_snapshot = Some(&snapshot);
+            inst.get_range(full_range.clone())?
+                .map(|e| e.map(|e| e.key().to_vec()))
+                .collect::<Result<_, _>>()?
+        };
+        assert_eq!(keys, vec![b"ape".to_vec()]);
+
+        // The forced commit leaves the store writable; the next batch is
+        // invisible to the held snapshot and visible live.
+        let mut replica = store.new_replica(myspace.clone())?;
+        replica.hash_and_insert("bee", &author, b"bee").await?;
+        drop(replica);
+        let keys_frozen: Vec<_> = {
+            let mut inst = StoreInstance::new(ns, &mut store);
+            inst.session_snapshot = Some(&snapshot);
+            inst.get_range(full_range.clone())?
+                .map(|e| e.map(|e| e.key().to_vec()))
+                .collect::<Result<_, _>>()?
+        };
+        assert_eq!(keys_frozen, vec![b"ape".to_vec()]);
+        assert_keys(&mut store, ns, vec![b"ape".to_vec(), b"bee".to_vec()]);
+        store.flush()?;
+        Ok(())
+    }
+
+    /// Two namespaces in one store, with entries in both. Returns the store,
+    /// the namespace under exchange, the neighbour, and the shared author.
+    async fn store_with_two_namespaces() -> Result<(Store, NamespaceSecret, NamespaceSecret, Author)>
+    {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(7);
+        let mut store = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let (mine, neighbour) = {
+            let a = NamespaceSecret::new(&mut rng);
+            let b = NamespaceSecret::new(&mut rng);
+            // Order them, so the neighbour's rows sit on a known side of
+            // mine in the shared records table.
+            if a.id() < b.id() {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+
+        let mut replica = store.new_replica(mine.clone())?;
+        replica.hash_and_insert("mine", &author, b"mine").await?;
+        drop(replica);
+        let mut replica = store.new_replica(neighbour.clone())?;
+        for key in ["secret-a", "secret-b"] {
+            replica
+                .hash_and_insert(key, &author, key.as_bytes())
+                .await?;
+        }
+        drop(replica);
+
+        Ok((store, mine, neighbour, author))
+    }
+
+    /// A range boundary is checked against the namespace under exchange.
+    /// Every namespace's records share one table, so an unchecked boundary
+    /// reads the neighbour's rows — and reconciliation hands what it reads
+    /// to the peer.
+    #[tokio::test]
+    async fn a_sync_range_naming_another_namespace_is_refused() -> Result<()> {
+        use crate::{ranger::Store as _, store::fs::StoreInstance};
+
+        let (mut store, mine, neighbour, author) = store_with_two_namespaces().await?;
+        let id = mine.id();
+        let all = Range::new(RecordIdentifier::default(), RecordIdentifier::default());
+        let at =
+            |ns: &NamespaceSecret, key: &[u8]| RecordIdentifier::new(ns.id(), author.id(), key);
+
+        // The neighbour's rows are really there, so a refusal below is a
+        // refusal to read them rather than an empty range.
+        assert_eq!(
+            store
+                .get_many(neighbour.id(), Query::all())?
+                .collect::<Result<Vec<_>, _>>()?
+                .len(),
+            2
+        );
+
+        // Authorized: the identity range and a boundary of this namespace
+        // both serve, and serve only this namespace's rows.
+        let mut inst = StoreInstance::new(id, &mut store);
+        let served: Vec<_> = inst.get_range(all.clone())?.collect::<Result<_, _>>()?;
+        assert_eq!(served.len(), 1);
+        assert!(served.iter().all(|entry| entry.namespace() == id));
+        assert!(inst
+            .get_range(Range::new(at(&mine, b""), at(&mine, b"\xff")))
+            .is_ok());
+        assert!(inst.get_fingerprint(&all).is_ok());
+
+        // Refused: a boundary naming the neighbour, in either range form,
+        // and whether both boundaries are foreign or only one.
+        let foreign_forward = Range::new(at(&neighbour, b""), at(&neighbour, b"\xff"));
+        let foreign_wrapping = Range::new(at(&neighbour, b"\xff"), at(&neighbour, b""));
+        let one_foreign_boundary = Range::new(at(&mine, b""), at(&neighbour, b"\xff"));
+        for range in [&foreign_forward, &foreign_wrapping, &one_foreign_boundary] {
+            assert!(
+                inst.get_range(range.clone()).is_err(),
+                "a foreign boundary served a range"
+            );
+            assert!(
+                inst.get_fingerprint(range).is_err(),
+                "a foreign boundary served a fingerprint"
+            );
+        }
+        Ok(())
+    }
+
+    /// The same check on the wire: a peer with a session on one namespace
+    /// crafts a range over the neighbour's rows. An empty fingerprint puts
+    /// the reply straight into the recursion anchor, which transmits every
+    /// entry of the range.
+    #[tokio::test]
+    async fn a_crafted_range_over_another_namespace_serves_nothing() -> Result<()> {
+        use crate::ranger::{Fingerprint, MessagePart, RangeFingerprint};
+
+        let (mut store, mine, neighbour, author) = store_with_two_namespaces().await?;
+        let mut replica = store.new_replica(mine.clone())?;
+
+        let range = Range::new(
+            RecordIdentifier::new(neighbour.id(), author.id(), b""),
+            RecordIdentifier::new(neighbour.id(), author.id(), b"\xff"),
+        );
+        let crafted = crate::ranger::Message::from_parts(vec![MessagePart::RangeFingerprint(
+            RangeFingerprint {
+                range,
+                fingerprint: Fingerprint::empty(),
+            },
+        )]);
+
+        let mut state = SyncOutcome::default();
+        let reply = replica
+            .sync_process_message(crafted, [9u8; 32], &mut state, None)
+            .await;
+        assert!(reply.is_err(), "the crafted range was served");
+        assert_eq!(state.num_sent, 0);
+        drop(replica);
+
+        // The neighbour's replica is untouched and still readable through
+        // its own namespace — the refusal is of the caller, not of the data.
+        assert_keys(
+            &mut store,
+            neighbour.id(),
+            vec![b"secret-a".to_vec(), b"secret-b".to_vec()],
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_future_timestamp() -> Result<()> {
         let mut rng = rand::rng();
         let mut store = store::Store::memory();
@@ -2718,6 +3176,83 @@ mod tests {
         Ok(())
     }
 
+    /// The rejection gate reads the live store, not the session's frozen
+    /// view. An entry landing after session setup is absent from the
+    /// egress snapshot, so the sender re-offers it; judged against the
+    /// snapshot the refusal would name an entry the receiver holds, and
+    /// the sender destroys its copy on that word.
+    #[tokio::test]
+    async fn a_rejection_never_names_an_entry_that_landed_after_session_setup() -> Result<()> {
+        let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
+        let mut store1 = store::Store::memory();
+        let mut store2 = store::Store::memory();
+        let author = Author::new(&mut rng);
+        let namespace = NamespaceSecret::new(&mut rng);
+        let id = namespace.id();
+        // The one entry both sides hold, byte for byte.
+        let held = {
+            let record = Record::new(Hash::new(b"payload"), 7, 1_700_000_000_000_000);
+            let entry = Entry::new(RecordIdentifier::new(id, author.id(), b"held"), record);
+            SignedEntry::from_entry(entry, &namespace, &author)
+        };
+
+        let mut alice = store1.new_replica(namespace.clone())?;
+        alice
+            .insert_remote_entry(held.clone(), [2u8; 32], ContentStatus::Complete)
+            .await?;
+        alice.hash_and_insert("fresh", &author, b"payload").await?;
+
+        // Bob's snapshot predates `held`: his egress hides it, so the sets
+        // read as divergent and alice re-offers what bob already holds.
+        let snapshot = store2.snapshot_owned()?;
+        let mut bob = store2.new_replica(namespace.clone())?;
+        bob.insert_remote_entry(held.clone(), [1u8; 32], ContentStatus::Complete)
+            .await?;
+        bob.store.session_snapshot = Some(&snapshot);
+
+        let judged: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Default::default();
+        let validator: CapabilityValidator = {
+            let sink = Arc::clone(&judged);
+            Arc::new(move |entry: &SignedEntry, _from: &PeerIdBytes| {
+                sink.lock().unwrap().push(entry.key().to_vec());
+                ValidateOutcome::Reject
+            })
+        };
+        assert!(bob.info.set_capability_validator(validator));
+
+        let rejections: Arc<std::sync::Mutex<Vec<RejectId>>> = Default::default();
+        let observer: RejectionObserver = {
+            let sink = Arc::clone(&rejections);
+            Arc::new(
+                move |_ns: NamespaceId, id: &RejectId, _from: &PeerIdBytes| {
+                    sink.lock().unwrap().push(id.clone());
+                },
+            )
+        };
+        assert!(alice.info.set_rejection_observer(observer));
+
+        sync(&mut alice, &mut bob).await?;
+
+        // Bob's gate judged the re-offered entry, so the test is not vacuous.
+        let judged = judged.lock().unwrap().clone();
+        assert!(
+            judged.iter().any(|key| key == b"held"),
+            "the frozen egress made alice re-offer the entry bob holds"
+        );
+
+        // Only the entry bob does not hold travelled back.
+        let seen = rejections.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "exactly one rejection");
+        assert_eq!(&seen[0].key[..], b"fresh");
+
+        assert_eq!(
+            store2.get_exact(id, author.id(), b"held", false)?,
+            Some(held),
+            "bob keeps the entry his snapshot cannot see"
+        );
+        Ok(())
+    }
+
     /// Retraction physically removes a record at or below the timestamp
     /// bound — no tombstone, no effect above the bound — and the key is
     /// insertable afresh afterwards.
@@ -3105,12 +3640,24 @@ mod tests {
         bob: &'a mut Replica<'a>,
         bob_filter: Option<crate::filter::EntryFilter>,
     ) -> Result<(SyncOutcome, SyncOutcome)> {
+        let first = alice.sync_initial_message(None)?;
+        sync_from_initial(alice, bob, first, bob_filter).await
+    }
+
+    /// Reconcile from an initial message the caller already took, so a test
+    /// can write between session setup and the rounds — the order that
+    /// makes a mid-session write mid-session.
+    async fn sync_from_initial<'a>(
+        alice: &'a mut Replica<'a>,
+        bob: &'a mut Replica<'a>,
+        first: crate::ranger::Message<SignedEntry>,
+        bob_filter: Option<crate::filter::EntryFilter>,
+    ) -> Result<(SyncOutcome, SyncOutcome)> {
         let alice_peer_id = [1u8; 32];
         let bob_peer_id = [2u8; 32];
         let mut alice_state = SyncOutcome::default();
         let mut bob_state = SyncOutcome::default();
-        // Sync alice - bob
-        let mut next_to_bob = Some(alice.sync_initial_message(None)?);
+        let mut next_to_bob = Some(first);
         let mut rounds = 0;
         while let Some(msg) = next_to_bob.take() {
             assert!(rounds < 100, "too many rounds");

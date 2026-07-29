@@ -85,6 +85,7 @@ pub struct TransactionAndTables {
     #[debug("TransactionAndTablesInner")]
     inner: TransactionAndTablesInner,
     pub(crate) since: Instant,
+    dirty: bool,
 }
 
 impl TransactionAndTables {
@@ -92,6 +93,7 @@ impl TransactionAndTables {
         Ok(Self {
             inner: TransactionAndTablesInner::try_new(tx, |tx| Tables::new(tx))?,
             since: Instant::now(),
+            dirty: false,
         })
     }
 
@@ -99,10 +101,20 @@ impl TransactionAndTables {
         self.inner.borrow_dependent()
     }
 
+    /// Whether anything was written through this transaction.
+    ///
+    /// Mutable access is the only way to write and it runs through
+    /// `with_tables_mut`, so this cannot miss a write; it does count a
+    /// closure that took mutable access and wrote nothing.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     pub fn with_tables_mut<T>(
         &mut self,
         f: impl FnOnce(&mut Tables) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
+        self.dirty = true;
         self.inner.with_dependent_mut(|_, t| f(t))
     }
 

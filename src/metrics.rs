@@ -1,6 +1,6 @@
 //! Metrics for iroh-docs
 
-use iroh_metrics::{Counter, MetricsGroup};
+use iroh_metrics::{Counter, Gauge, MetricsGroup};
 
 /// Metrics for iroh-docs
 #[derive(Debug, Default, MetricsGroup)]
@@ -24,6 +24,21 @@ pub struct Metrics {
 
     /// Number of times the main actor loop ticked
     pub actor_tick_main: Counter,
+
+    /// Sync sessions holding a store snapshot right now.
+    ///
+    /// A snapshot holds back reclamation of every store page freed while it
+    /// lives, so a value that does not fall back to zero when the node goes
+    /// quiet is the store growing for a reason no entry count explains.
+    pub sync_sessions_open: Gauge,
+    /// Sync session snapshots the actor reclaimed by itself, because the
+    /// handle was gone and no release message arrived.
+    ///
+    /// The ordinary path is a handle releasing its own snapshot, so this
+    /// stays at zero. Above zero it counts the two cases that path misses:
+    /// a release lost to a full actor queue, and a registration whose
+    /// handle a cancelled caller never received.
+    pub sync_sessions_reclaimed: Counter,
 
     /// Number of times the gossip actor loop ticked
     pub doc_gossip_tick_main: Counter,

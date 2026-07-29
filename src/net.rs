@@ -1,9 +1,12 @@
 //! Network implementation of the iroh-docs protocol
 
-use std::future::Future;
+use std::{
+    future::Future,
+    sync::{Arc, OnceLock},
+};
 
 use iroh::{Endpoint, EndpointAddr, PublicKey};
-use n0_future::time::{Duration, Instant};
+use n0_future::time::{self, Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error_span, trace, Instrument};
 
@@ -19,11 +22,70 @@ pub const ALPN: &[u8] = b"/iroh-sync/1";
 
 mod codec;
 
+/// Bound on one whole sync exchange, connection establishment included.
+///
+/// Nothing below this point carries a timeout of its own, so a peer that
+/// stays connected and stops talking stalls forever. Two things ride on the
+/// bound. The live actor tracks one running exchange per namespace and peer
+/// and refuses to start another while one runs, so a stalled exchange
+/// blocks that pair and drops every later sync trigger silently. And a
+/// session holds a store snapshot, whose read transaction holds back
+/// reclamation of every page freed while it lives — of the oldest live one,
+/// so concurrent sessions cost the same window as a single one, and the
+/// window is this bound.
+///
+/// The bound is on the exchange as a whole, not on the wait between
+/// messages, and there is no shorter liveness bound beside it. A peer
+/// sending one message every few seconds defeats a between-messages bound
+/// while holding both resources. A connection that goes dead rather than
+/// quiet — a phone entering a tunnel — is already cut below, by QUIC keep
+/// alives against its idle timeout, well inside this bound. And a
+/// between-messages bound could not tell a slow transfer from silence
+/// anyway: a message is delivered whole, so a peer sending one large
+/// message for minutes looks exactly like a peer sending nothing.
+///
+/// The value covers a first sync of a large store over a slow link: an
+/// entry is roughly 280 bytes on the wire, and a peer holding nothing
+/// receives the served set in one message, so 10,000 entries are about 2.8
+/// MB — five minutes carry that from about 75 kbit/s up. Beyond that the
+/// exchange cannot complete at all rather than completing slowly, because a
+/// message is ingested whole or not at all: a cut mid-message delivers
+/// nothing, and the next session starts over. Raising the bound moves that
+/// cliff; only bounding the size of a transmitted set removes it.
+pub const SYNC_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Connect to a peer and sync a replica.
 ///
 /// `filter` is this side's egress filter for the session: what the dialing
 /// node reveals of its replica to the peer. `None` serves the full view.
+///
+/// The session serves entries from a store snapshot frozen at session
+/// setup, so the served view is stable across the exchange; entries
+/// written meanwhile travel on the next session. The snapshot is released
+/// when the session ends, on every path. The whole exchange is bounded by
+/// [`SYNC_SESSION_TIMEOUT`].
 pub async fn connect_and_sync(
+    endpoint: &Endpoint,
+    sync: &SyncHandle,
+    namespace: NamespaceId,
+    peer: EndpointAddr,
+    metrics: Option<&Metrics>,
+    filter: Option<crate::filter::EntryFilter>,
+) -> Result<SyncFinished, ConnectError> {
+    match time::timeout(
+        SYNC_SESSION_TIMEOUT,
+        connect_and_sync_inner(endpoint, sync, namespace, peer, metrics, filter),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_elapsed) => Err(ConnectError::connect(anyhow::anyhow!(
+            "sync exchange timed out after {SYNC_SESSION_TIMEOUT:?}"
+        ))),
+    }
+}
+
+async fn connect_and_sync_inner(
     endpoint: &Endpoint,
     sync: &SyncHandle,
     namespace: NamespaceId,
@@ -128,7 +190,59 @@ impl std::fmt::Debug for AcceptOutcome {
 }
 
 /// Handle an iroh-docs connection and sync all shared documents in the replica store.
+///
+/// An allowed session serves entries from a store snapshot frozen right
+/// after the accept decision (see [`connect_and_sync`] for the snapshot
+/// semantics); a rejected request never opens one. The whole exchange is
+/// bounded by [`SYNC_SESSION_TIMEOUT`], mirroring [`connect_and_sync`]: a
+/// stalled accept blocks the pair just the same.
 pub async fn handle_connection<F, Fut>(
+    sync: SyncHandle,
+    connection: iroh::endpoint::Connection,
+    accept_cb: F,
+    metrics: Option<&Metrics>,
+) -> Result<SyncFinished, AcceptError>
+where
+    F: Fn(NamespaceId, PublicKey) -> Fut,
+    Fut: Future<Output = AcceptOutcome>,
+{
+    let peer = connection.remote_id();
+    // A timeout has to name the namespace to release the pair the accept
+    // decision registered as running — an error without one is routed as a
+    // failure before the first message and leaves the pair running for
+    // good. Before that decision there is nothing registered to name.
+    let accepted: Arc<OnceLock<NamespaceId>> = Default::default();
+    let observed_accept_cb = {
+        let accepted = Arc::clone(&accepted);
+        move |namespace, peer| {
+            let accepted = Arc::clone(&accepted);
+            let decision = accept_cb(namespace, peer);
+            async move {
+                let outcome = decision.await;
+                if matches!(outcome, AcceptOutcome::Allow { .. }) {
+                    let _ = accepted.set(namespace);
+                }
+                outcome
+            }
+        }
+    };
+
+    match time::timeout(
+        SYNC_SESSION_TIMEOUT,
+        handle_connection_inner(sync, connection, observed_accept_cb, metrics),
+    )
+    .await
+    {
+        Ok(res) => res,
+        Err(_elapsed) => Err(AcceptError::sync(
+            peer,
+            accepted.get().copied(),
+            anyhow::anyhow!("sync exchange timed out after {SYNC_SESSION_TIMEOUT:?}"),
+        )),
+    }
+}
+
+async fn handle_connection_inner<F, Fut>(
     sync: SyncHandle,
     connection: iroh::endpoint::Connection,
     accept_cb: F,

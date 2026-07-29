@@ -3,14 +3,21 @@
 use std::{
     collections::{hash_map, HashMap},
     num::NonZeroU64,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc, Weak,
+    },
 };
 
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use iroh_blobs::Hash;
 use irpc::channel::mpsc;
-use n0_future::{task::JoinSet, time::Duration, TryFutureExt};
+use n0_future::{
+    task::JoinSet,
+    time::{Duration, Instant},
+    TryFutureExt,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 #[cfg(wasm_browser)]
@@ -25,7 +32,7 @@ use crate::{
     metrics::Metrics,
     ranger::Message,
     store::{
-        fs::{ContentHashesIterator, StoreInstance},
+        fs::{tables::ReadOnlyTables, ContentHashesIterator, StoreInstance},
         DownloadPolicy, ImportNamespaceOutcome, Query, Store,
     },
     Author, AuthorHeads, AuthorId, Capability, CapabilityValidator, ContentStatus,
@@ -35,6 +42,10 @@ use crate::{
 
 const ACTION_CAP: usize = 1024;
 pub(crate) const MAX_COMMIT_DELAY: Duration = Duration::from_millis(500);
+
+/// Hands each actor an id unique in this process, so a session id names the
+/// actor that issued it and not just a position in its own counting.
+static NEXT_ACTOR_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(derive_more::Debug, derive_more::Display)]
 enum Action {
@@ -84,6 +95,11 @@ enum Action {
     },
     #[display("Replica({}, {})", _0.fmt_short(), _1)]
     Replica(NamespaceId, ReplicaAction),
+    /// Release of a session's snapshot. Top level rather than addressed to
+    /// a replica: releasing needs no open replica, and a late release after
+    /// the replica closed is a no-op either way.
+    #[display("SyncSessionEnd")]
+    SyncSessionEnd { session: SyncSessionId },
     #[display("Shutdown")]
     Shutdown {
         #[debug("reply")]
@@ -92,6 +108,12 @@ enum Action {
     #[cfg(test)]
     #[display("DebugTasksLen")]
     DebugTasksLen {
+        #[debug("reply")]
+        reply: oneshot::Sender<usize>,
+    },
+    #[cfg(test)]
+    #[display("DebugSessionCount")]
+    DebugSessionCount {
         #[debug("reply")]
         reply: oneshot::Sender<usize>,
     },
@@ -155,7 +177,12 @@ enum ReplicaAction {
         #[debug("reply")]
         reply: oneshot::Sender<Result<()>>,
     },
+    SyncSessionStart {
+        #[debug("reply")]
+        reply: oneshot::Sender<Result<(SyncSessionId, Arc<()>)>>,
+    },
     SyncInitialMessage {
+        session: SyncSessionId,
         #[debug("filter")]
         filter: Option<crate::filter::EntryFilter>,
         #[debug("reply")]
@@ -165,6 +192,7 @@ enum ReplicaAction {
         message: Message<SignedEntry>,
         from: PeerIdBytes,
         state: SyncOutcome,
+        session: SyncSessionId,
         #[debug("filter")]
         filter: Option<crate::filter::EntryFilter>,
         #[debug("reply")]
@@ -229,6 +257,73 @@ struct OpenReplica {
     handles: usize,
 }
 
+/// Identifies one sync session's frozen read snapshot inside the actor.
+///
+/// The issuing actor is part of the identity. Each actor counts its own
+/// sessions from zero, so without it the first session of one handle names
+/// the first session of another, and a handle handed a foreign id would
+/// resolve its own snapshot of that namespace and serve a session from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SyncSessionId {
+    actor: u64,
+    seq: u64,
+}
+
+/// Handle to one sync session's read snapshot in the actor.
+///
+/// The snapshot pins a redb read transaction, so its lifetime must stay
+/// within session bounds: dropping the handle releases it, which covers
+/// every session exit path — success, error, and cancellation alike.
+///
+/// The handle's liveness, not the release message, is what the actor goes
+/// by. `alive` is the only strong reference to its registration, so an
+/// entry outlives its handle no longer than the actor's next tick, whether
+/// the message was lost to a full queue or the handle was never built at
+/// all — a caller cancelled between registration and reply leaves the
+/// reference in the undelivered reply. The message is the prompt path.
+#[must_use = "dropping the handle ends the session and releases its snapshot"]
+#[derive(Debug)]
+pub struct SyncSession {
+    id: SyncSessionId,
+    namespace: NamespaceId,
+    tx: async_channel::Sender<Action>,
+    /// Held, never read: the actor watches the strong count.
+    _alive: Arc<()>,
+}
+
+impl SyncSession {
+    /// The id to pass into [`SyncHandle::sync_initial_message`] and
+    /// [`SyncHandle::sync_process_message`].
+    pub fn id(&self) -> SyncSessionId {
+        self.id
+    }
+
+    /// The namespace this session is of.
+    pub fn namespace(&self) -> NamespaceId {
+        self.namespace
+    }
+}
+
+impl Drop for SyncSession {
+    fn drop(&mut self) {
+        let _ = self
+            .tx
+            .try_send(Action::SyncSessionEnd { session: self.id });
+    }
+}
+
+/// A session's frozen snapshot, held by the actor until released.
+#[derive(derive_more::Debug)]
+struct SessionSnapshot {
+    namespace: NamespaceId,
+    #[debug("ReadOnlyTables")]
+    tables: ReadOnlyTables,
+    /// Weak counterpart of the handle's strong reference: once it holds
+    /// nothing, no handle can name this snapshot again and the actor
+    /// reclaims it on its next tick.
+    alive: Weak<()>,
+}
+
 /// The [`SyncHandle`] controls an actor thread which executes replica and store operations.
 ///
 /// The [`SyncHandle`] exposes async methods which all send messages into the actor thread, usually
@@ -287,8 +382,12 @@ impl SyncHandle {
         let metrics = Arc::new(Metrics::default());
         let (action_tx, action_rx) = async_channel::bounded(ACTION_CAP);
         let actor = Actor {
+            actor_id: NEXT_ACTOR_ID.fetch_add(1, AtomicOrdering::Relaxed),
             store,
             states: Default::default(),
+            sessions: Default::default(),
+            next_session_id: 0,
+            last_session_sweep: Instant::now(),
             action_rx,
             content_status_callback,
             capability_validator,
@@ -420,13 +519,51 @@ impl SyncHandle {
         rx.await?
     }
 
+    /// Open a sync session on `namespace`: freeze a read snapshot for the
+    /// session's egress.
+    ///
+    /// Every read the session serves the peer derives from the snapshot,
+    /// so the served view is stable across the session's rounds while
+    /// writes continue on the live store. Opening commits the store's
+    /// pending write batch, so the snapshot holds every entry inserted
+    /// before session setup. The returned handle owns the snapshot;
+    /// dropping it releases the snapshot on any session exit path.
+    pub async fn sync_session_start(&self, namespace: NamespaceId) -> Result<SyncSession> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::SyncSessionStart { reply };
+        self.send_replica(namespace, action).await?;
+        let (id, alive) = rx.await??;
+        Ok(SyncSession {
+            id,
+            namespace,
+            tx: self.tx.clone(),
+            _alive: alive,
+        })
+    }
+
+    /// Register a session and abandon the reply, as a caller cancelled
+    /// between the two does.
+    #[cfg(test)]
+    pub(crate) async fn debug_abandon_session_start(&self, namespace: NamespaceId) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let action = ReplicaAction::SyncSessionStart { reply };
+        self.send_replica(namespace, action).await?;
+        drop(rx);
+        Ok(())
+    }
+
     pub async fn sync_initial_message(
         &self,
         namespace: NamespaceId,
+        session: SyncSessionId,
         filter: Option<crate::filter::EntryFilter>,
     ) -> Result<Message<SignedEntry>> {
         let (reply, rx) = oneshot::channel();
-        let action = ReplicaAction::SyncInitialMessage { filter, reply };
+        let action = ReplicaAction::SyncInitialMessage {
+            session,
+            filter,
+            reply,
+        };
         self.send_replica(namespace, action).await?;
         rx.await?
     }
@@ -437,6 +574,7 @@ impl SyncHandle {
         message: Message<SignedEntry>,
         from: PeerIdBytes,
         state: SyncOutcome,
+        session: SyncSessionId,
         filter: Option<crate::filter::EntryFilter>,
     ) -> Result<(Option<Message<SignedEntry>>, SyncOutcome)> {
         let (reply, rx) = oneshot::channel();
@@ -445,10 +583,19 @@ impl SyncHandle {
             message,
             from,
             state,
+            session,
             filter,
         };
         self.send_replica(namespace, action).await?;
         rx.await?
+    }
+
+    /// Number of registered sync-session snapshots (test observability).
+    #[cfg(test)]
+    pub(crate) async fn debug_session_count(&self) -> Result<usize> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Action::DebugSessionCount { reply }).await?;
+        Ok(rx.await?)
     }
 
     pub async fn get_sync_peers(&self, namespace: NamespaceId) -> Result<Option<Vec<PeerIdBytes>>> {
@@ -683,8 +830,18 @@ impl Drop for SyncHandle {
 }
 
 struct Actor {
+    /// This actor's id in the process; part of every session id it issues.
+    actor_id: u64,
     store: Store,
     states: OpenReplicas,
+    /// Frozen read snapshots of running sync sessions, keyed by session id.
+    ///
+    /// Each entry pins a redb read transaction until removed: the session
+    /// guard's drop removes it, and closing the replica sweeps whatever a
+    /// lost release message left behind.
+    sessions: HashMap<SyncSessionId, SessionSnapshot>,
+    next_session_id: u64,
+    last_session_sweep: Instant,
     action_rx: async_channel::Receiver<Action>,
     content_status_callback: Option<ContentStatusCallback>,
     capability_validator: Option<CapabilityValidator>,
@@ -710,6 +867,10 @@ impl Actor {
             tokio::pin!(timeout);
             let action = tokio::select! {
                 _ = &mut timeout => {
+                    // Before the flush, not after: releasing the read
+                    // transactions of sessions whose handle is gone lets
+                    // this very commit reclaim the pages they pinned.
+                    self.reclaim_abandoned_sessions();
                     if let Err(cause) = self.store.flush() {
                         error!(?cause, "failed to flush store");
                     }
@@ -736,6 +897,9 @@ impl Actor {
             };
             trace!(%action, "tick");
             self.metrics.actor_tick_main.inc();
+            // The arm above runs only while the actor is idle, and an actor
+            // under load is exactly where a pinned page set hurts.
+            self.reclaim_abandoned_sessions();
             match action {
                 Action::Shutdown { reply } => {
                     break reply;
@@ -766,6 +930,8 @@ impl Actor {
             }
             #[cfg(test)]
             Action::DebugTasksLen { reply } => send_reply(reply, self.tasks.len()),
+            #[cfg(test)]
+            Action::DebugSessionCount { reply } => send_reply(reply, self.sessions.len()),
             Action::ImportAuthor { author, reply } => {
                 let id = author.id();
                 send_reply(reply, self.store.import_author(author).map(|_| id))
@@ -810,6 +976,11 @@ impl Actor {
                 send_reply_with(reply, self, |this| this.store.content_hashes())
             }
             Action::FlushStore { reply } => send_reply(reply, self.store.flush()),
+            Action::SyncSessionEnd { session } => {
+                self.sessions.remove(&session);
+                self.record_open_sessions();
+                Ok(())
+            }
             Action::Replica(namespace, action) => self.on_replica_action(namespace, action).await,
         }
     }
@@ -881,9 +1052,11 @@ impl Actor {
                 reply,
             } => {
                 send_reply_with_async(reply, self, async move |this| {
-                    let mut replica = this
-                        .states
-                        .replica_if_syncing(&namespace, &mut this.store)?;
+                    // Ingest reads live: an entry the peer sends is judged
+                    // against current state, never a session's frozen view.
+                    let mut replica =
+                        this.states
+                            .replica_if_syncing(&namespace, &mut this.store, None)?;
                     let len = entry.content_len();
                     replica
                         .insert_remote_entry(entry, from, content_status)
@@ -895,26 +1068,62 @@ impl Actor {
                 .await
             }
 
-            ReplicaAction::SyncInitialMessage { filter, reply } => {
-                send_reply_with(reply, self, move |this| {
-                    let mut replica = this
-                        .states
-                        .replica_if_syncing(&namespace, &mut this.store)?;
-                    let res = replica.sync_initial_message(filter)?;
-                    Ok(res)
-                })
-            }
+            ReplicaAction::SyncSessionStart { reply } => send_reply_with(reply, self, |this| {
+                this.states.ensure_syncing(&namespace)?;
+                // Committing the pending write batch is part of the
+                // contract (`snapshot_owned` flushes): the snapshot holds
+                // every entry inserted before session setup.
+                let tables = this.store.snapshot_owned()?;
+                let id = this.next_session_id;
+                this.next_session_id += 1;
+                // The strong reference travels in the reply, so an
+                // undelivered one leaves the registration unreferenced and
+                // the tick reclaims it.
+                let alive = Arc::new(());
+                let id = SyncSessionId {
+                    actor: this.actor_id,
+                    seq: id,
+                };
+                this.sessions.insert(
+                    id,
+                    SessionSnapshot {
+                        namespace,
+                        tables,
+                        alive: Arc::downgrade(&alive),
+                    },
+                );
+                this.record_open_sessions();
+                Ok((id, alive))
+            }),
+            ReplicaAction::SyncInitialMessage {
+                session,
+                filter,
+                reply,
+            } => send_reply_with(reply, self, move |this| {
+                let snapshot =
+                    session_snapshot(&this.sessions, this.actor_id, session, &namespace)?;
+                let mut replica =
+                    this.states
+                        .replica_if_syncing(&namespace, &mut this.store, Some(snapshot))?;
+                let res = replica.sync_initial_message(filter)?;
+                Ok(res)
+            }),
             ReplicaAction::SyncProcessMessage {
                 message,
                 from,
                 mut state,
+                session,
                 filter,
                 reply,
             } => {
                 let res = async {
-                    let mut replica = self
-                        .states
-                        .replica_if_syncing(&namespace, &mut self.store)?;
+                    let snapshot =
+                        session_snapshot(&self.sessions, self.actor_id, session, &namespace)?;
+                    let mut replica = self.states.replica_if_syncing(
+                        &namespace,
+                        &mut self.store,
+                        Some(snapshot),
+                    )?;
                     let res = replica
                         .sync_process_message(message, from, &mut state, filter)
                         .await?;
@@ -995,15 +1204,54 @@ impl Actor {
         }
     }
 
+    /// Drop the snapshots of sessions whose handle is gone, no more often
+    /// than the actor's own housekeeping cadence.
+    ///
+    /// A handle releases its snapshot by message; this covers the cases
+    /// where no message comes — a release lost to a full queue, and a
+    /// registration whose handle a cancelled caller never received.
+    fn reclaim_abandoned_sessions(&mut self) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        if self.last_session_sweep.elapsed() < MAX_COMMIT_DELAY {
+            return;
+        }
+        self.last_session_sweep = Instant::now();
+        let before = self.sessions.len();
+        self.sessions.retain(|_, s| s.alive.strong_count() > 0);
+        let reclaimed = before - self.sessions.len();
+        if reclaimed > 0 {
+            self.metrics
+                .sync_sessions_reclaimed
+                .inc_by(reclaimed as u64);
+        }
+        self.record_open_sessions();
+    }
+
+    /// Publish how many snapshots are held, from the map rather than by
+    /// counting the sites that change it, so the two cannot drift apart.
+    fn record_open_sessions(&self) {
+        self.metrics
+            .sync_sessions_open
+            .set(self.sessions.len() as i64);
+    }
+
     fn close(&mut self, namespace: NamespaceId) -> bool {
         let res = self.states.close(namespace);
         if res {
+            // A closed replica has no sessions; this also reclaims
+            // snapshots whose release message was lost.
+            self.sessions.retain(|_, s| s.namespace != namespace);
+            self.record_open_sessions();
             self.store.close_replica(namespace);
         }
         res
     }
 
     fn close_all(&mut self) {
+        self.sessions.clear();
+        self.record_open_sessions();
         for id in self.states.close_all() {
             self.store.close_replica(id);
         }
@@ -1027,6 +1275,32 @@ impl Actor {
     }
 }
 
+/// Resolve a session id to its frozen snapshot.
+///
+/// The id must name a registered session of this namespace, issued by this
+/// actor: anything else is an error, so a session whose snapshot is gone
+/// (the replica was closed under it) or whose id came from another handle
+/// fails instead of silently serving a different view.
+fn session_snapshot<'a>(
+    sessions: &'a HashMap<SyncSessionId, SessionSnapshot>,
+    actor_id: u64,
+    session: SyncSessionId,
+    namespace: &NamespaceId,
+) -> Result<&'a ReadOnlyTables> {
+    anyhow::ensure!(
+        session.actor == actor_id,
+        "sync session was issued by another actor"
+    );
+    let entry = sessions
+        .get(&session)
+        .context("sync session not registered")?;
+    anyhow::ensure!(
+        entry.namespace == *namespace,
+        "sync session belongs to another namespace"
+    );
+    Ok(&entry.tables)
+}
+
 #[derive(Default)]
 struct OpenReplicas(HashMap<NamespaceId, OpenReplica>);
 
@@ -1043,17 +1317,35 @@ impl OpenReplicas {
         ))
     }
 
+    /// The replica to run a sync exchange against, reading through
+    /// `session_snapshot`.
+    ///
+    /// The snapshot is a parameter rather than something assigned onto the
+    /// replica afterwards: a caller cannot then forget it and silently
+    /// serve live reads, which is the drift this whole mechanism exists to
+    /// prevent. Ingest passes `None` and says so at the call site.
     fn replica_if_syncing<'a, 'b>(
         &'a mut self,
         namespace: &NamespaceId,
         store: &'b mut Store,
+        session_snapshot: Option<&'b ReadOnlyTables>,
     ) -> Result<Replica<'b, &'a mut ReplicaInfo>> {
+        self.ensure_syncing(namespace)?;
         let state = self.get_mut(namespace)?;
-        anyhow::ensure!(state.sync, "sync is not enabled for replica");
         Ok(Replica::new(
-            StoreInstance::new(state.info.capability.id(), store),
+            StoreInstance::with_session_snapshot(
+                state.info.capability.id(),
+                store,
+                session_snapshot,
+            ),
             &mut state.info,
         ))
+    }
+
+    fn ensure_syncing(&mut self, namespace: &NamespaceId) -> Result<()> {
+        let state = self.get_mut(namespace)?;
+        anyhow::ensure!(state.sync, "sync is not enabled for replica");
+        Ok(())
     }
 
     fn get_mut(&mut self, namespace: &NamespaceId) -> Result<&mut OpenReplica> {
