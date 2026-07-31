@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"constant":["ALPN"],"enum":["AbortReason","AcceptError","AcceptOutcome","ConnectError"],"fn":["connect_and_sync","handle_connection"],"struct":["SyncFinished","Timings"]};
+window.SIDEBAR_ITEMS = {"constant":["ALPN","SYNC_SESSION_TIMEOUT"],"enum":["AbortReason","AcceptError","AcceptOutcome","ConnectError"],"fn":["connect_and_sync","handle_connection"],"struct":["SyncFinished","Timings"]};

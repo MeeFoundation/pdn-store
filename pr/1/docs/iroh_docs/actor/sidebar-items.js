@@ -1,1 +1,1 @@
-window.SIDEBAR_ITEMS = {"struct":["OpenOpts","OpenState","SyncHandle"]};
+window.SIDEBAR_ITEMS = {"struct":["OpenOpts","OpenState","SyncHandle","SyncSession","SyncSessionId"]};
