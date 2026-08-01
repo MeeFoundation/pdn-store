@@ -1184,8 +1184,63 @@ const AUTHOR_BYTES: std::ops::Range<usize> = 32..64;
 const KEY_BYTES: std::ops::RangeFrom<usize> = 64..;
 
 /// The identifier of a record.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// It opens with a 32-byte namespace and a 32-byte author, and every
+/// accessor slices both unchecked, so a value lacking them must not exist.
+/// [`new`](Self::new) always writes them; deserialization is hand-written
+/// to refuse anything shorter, because that is the one way a value enters
+/// from outside this crate — a range boundary or an entry off the wire.
+#[derive(Clone, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RecordIdentifier(Bytes);
+
+/// Namespace and author: the fixed head every record identifier carries.
+pub(crate) const ID_HEAD_BYTES: usize = AUTHOR_BYTES.end;
+
+/// The one constructor for an identifier whose bytes come from outside.
+fn record_identifier_from_bytes<E: serde::de::Error>(bytes: Bytes) -> Result<RecordIdentifier, E> {
+    if bytes.len() < ID_HEAD_BYTES {
+        return Err(E::invalid_length(
+            bytes.len(),
+            &"a record identifier carrying a 32-byte namespace and a 32-byte author",
+        ));
+    }
+    Ok(RecordIdentifier(bytes))
+}
+
+impl<'de> Deserialize<'de> for RecordIdentifier {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RecordIdentifierVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RecordIdentifierVisitor {
+            type Value = RecordIdentifier;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "a record identifier of at least {ID_HEAD_BYTES} bytes")
+            }
+
+            // Both shapes serde's derive accepts for a newtype struct, so
+            // every format decodes the same value the derive would.
+            fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Self::Value, D::Error> {
+                record_identifier_from_bytes(Bytes::deserialize(deserializer)?)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let bytes = seq
+                    .next_element::<Bytes>()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                record_identifier_from_bytes(bytes)
+            }
+        }
+
+        deserializer.deserialize_newtype_struct("RecordIdentifier", RecordIdentifierVisitor)
+    }
+}
 
 impl Default for RecordIdentifier {
     fn default() -> Self {
@@ -3687,6 +3742,34 @@ mod tests {
             store.get_exact(*namespace, author.id(), el, false)?;
         }
         Ok(())
+    }
+
+    /// A record identifier decoded from outside carries its fixed head.
+    ///
+    /// Every accessor slices the namespace and the author unchecked, so a
+    /// shorter value has to fail in the decoder: reaching a reader with one
+    /// panics the thread that owns the store, for every namespace of every
+    /// identity the node hosts.
+    #[test]
+    fn a_short_record_identifier_is_refused_by_the_decoder() {
+        // postcard writes the inner byte string as a varint length followed
+        // by that many bytes; every length below is one varint byte.
+        for len in [0usize, 1, 31, 32, 63] {
+            let mut encoded = vec![u8::try_from(len).unwrap()];
+            encoded.extend(std::iter::repeat_n(0u8, len));
+            assert!(
+                postcard::from_bytes::<RecordIdentifier>(&encoded).is_err(),
+                "a {len}-byte identifier decoded"
+            );
+        }
+
+        let id = RecordIdentifier::new(NamespaceId::default(), AuthorId::default(), b"");
+        let encoded = postcard::to_stdvec(&id).unwrap();
+        assert_eq!(encoded.len(), 1 + ID_HEAD_BYTES);
+        assert_eq!(
+            postcard::from_bytes::<RecordIdentifier>(&encoded).unwrap(),
+            id
+        );
     }
 
     /// Snapshot of the `SignedEntry` postcard wire format used by doc sync.

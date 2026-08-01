@@ -1234,4 +1234,51 @@ mod tests {
         handle.shutdown().await?;
         Ok(())
     }
+
+    /// A frame whose range boundary is shorter than a namespace and an
+    /// author is refused here, at the decoder.
+    ///
+    /// The readers below slice both unchecked, and they run on the thread
+    /// that owns the store: a boundary that reaches them takes down sync for
+    /// every namespace of every identity the node hosts, on one frame from
+    /// any peer holding a ticket to any one replica.
+    #[test]
+    fn a_frame_naming_a_short_range_boundary_is_refused() -> Result<()> {
+        let mut rng = rand::rng();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut store = store::Store::memory();
+        let mut replica = store.new_replica(namespace.clone())?;
+        let initial = replica.sync_initial_message(None)?;
+        drop(replica);
+
+        let mut codec = SyncCodec;
+        let mut frame = BytesMut::new();
+        codec.encode(super::Message::Sync(initial), &mut frame)?;
+
+        // Control: the frame decodes as it stands, so the splice below is
+        // what the refusal is about.
+        let mut intact = frame.clone();
+        assert!(codec.decode(&mut intact)?.is_some());
+
+        // Both boundaries of an empty replica are the default identifier: a
+        // zeroed head behind its postcard length. Shrink the first to an
+        // empty byte string, the shape a peer crafts.
+        let head = crate::sync::ID_HEAD_BYTES;
+        let boundary: Vec<u8> = std::iter::once(u8::try_from(head).unwrap())
+            .chain(std::iter::repeat_n(0u8, head))
+            .collect();
+        let at = frame
+            .windows(boundary.len())
+            .position(|window| window == boundary)
+            .expect("the initial message names the default identifier");
+        let mut spliced = BytesMut::new();
+        spliced.extend_from_slice(&frame[..at]);
+        spliced.extend_from_slice(&[0u8]);
+        spliced.extend_from_slice(&frame[at + boundary.len()..]);
+        let body = u32::try_from(spliced.len() - 4).unwrap();
+        spliced[..4].copy_from_slice(&body.to_be_bytes());
+
+        assert!(codec.decode(&mut spliced).is_err());
+        Ok(())
+    }
 }
