@@ -985,6 +985,23 @@ impl Actor {
         }
     }
 
+    /// The replica a session's exchange runs against: egress reads through
+    /// the snapshot that session registered.
+    ///
+    /// Resolving the session and handing over its snapshot are one step on
+    /// purpose: two call sites are two places to pass `None` and serve the
+    /// peer live reads instead, and the store answers either way, so only a
+    /// test that runs an exchange tells the two apart.
+    fn session_replica(
+        &mut self,
+        namespace: &NamespaceId,
+        session: SyncSessionId,
+    ) -> Result<Replica<'_, &mut ReplicaInfo>> {
+        let snapshot = session_snapshot(&self.sessions, self.actor_id, session, namespace)?;
+        self.states
+            .replica_if_syncing(namespace, &mut self.store, Some(snapshot))
+    }
+
     async fn on_replica_action(
         &mut self,
         namespace: NamespaceId,
@@ -1100,12 +1117,9 @@ impl Actor {
                 filter,
                 reply,
             } => send_reply_with(reply, self, move |this| {
-                let snapshot =
-                    session_snapshot(&this.sessions, this.actor_id, session, &namespace)?;
-                let mut replica =
-                    this.states
-                        .replica_if_syncing(&namespace, &mut this.store, Some(snapshot))?;
-                let res = replica.sync_initial_message(filter)?;
+                let res = this
+                    .session_replica(&namespace, session)?
+                    .sync_initial_message(filter)?;
                 Ok(res)
             }),
             ReplicaAction::SyncProcessMessage {
@@ -1117,13 +1131,7 @@ impl Actor {
                 reply,
             } => {
                 let res = async {
-                    let snapshot =
-                        session_snapshot(&self.sessions, self.actor_id, session, &namespace)?;
-                    let mut replica = self.states.replica_if_syncing(
-                        &namespace,
-                        &mut self.store,
-                        Some(snapshot),
-                    )?;
+                    let mut replica = self.session_replica(&namespace, session)?;
                     let res = replica
                         .sync_process_message(message, from, &mut state, filter)
                         .await?;

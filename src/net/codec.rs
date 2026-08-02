@@ -1281,4 +1281,183 @@ mod tests {
         assert!(codec.decode(&mut spliced).is_err());
         Ok(())
     }
+
+    /// Runs one exchange to completion over the two handles, the way the
+    /// wire loops do: each side's rounds go through its own session.
+    async fn exchange_over_sessions(
+        alice: &SyncHandle,
+        alice_session: &crate::actor::SyncSession,
+        alice_peer: PublicKey,
+        bob: &SyncHandle,
+        bob_session: &crate::actor::SyncSession,
+        bob_peer: PublicKey,
+        namespace: NamespaceId,
+    ) -> Result<(SyncOutcome, SyncOutcome, usize)> {
+        let mut alice_state = SyncOutcome::default();
+        let mut bob_state = SyncOutcome::default();
+        let mut messages = 0;
+        let mut message = alice
+            .sync_initial_message(namespace, alice_session.id(), None)
+            .await?;
+        loop {
+            messages += 1;
+            let (reply, next) = bob
+                .sync_process_message(
+                    namespace,
+                    message,
+                    *alice_peer.as_bytes(),
+                    std::mem::take(&mut bob_state),
+                    bob_session.id(),
+                    None,
+                )
+                .await?;
+            bob_state = next;
+            let Some(reply) = reply else { break };
+            messages += 1;
+            let (back, next) = alice
+                .sync_process_message(
+                    namespace,
+                    reply,
+                    *bob_peer.as_bytes(),
+                    std::mem::take(&mut alice_state),
+                    alice_session.id(),
+                    None,
+                )
+                .await?;
+            alice_state = next;
+            let Some(back) = back else { break };
+            message = back;
+        }
+        Ok((alice_state, bob_state, messages))
+    }
+
+    /// A session serves the set frozen at its start, through the actor —
+    /// which is where the snapshot is looked up and handed to the replica.
+    ///
+    /// Each stage writes between the session's start and its first message,
+    /// and the write travels on the next session rather than this one.
+    /// Reading live instead shows up in two ways, one per call the actor
+    /// wires: the rounds hand the entry to the peer, and the initial message
+    /// names a set the peer lacks, so two sides that hold the same entries
+    /// start exchanging over nothing — which is what the last stage is for.
+    #[tokio::test]
+    async fn a_session_serves_the_view_frozen_at_its_start() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+
+        let mut alice_store = store::Store::memory();
+        alice_store.new_replica(namespace.clone())?;
+        alice_store.close_replica(ns);
+        let author = alice_store.new_author(&mut rng)?.id();
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        bob.open(ns, OpenOpts::default().sync()).await?;
+
+        let write = async |key: &str| {
+            alice
+                .insert_local(
+                    ns,
+                    author,
+                    key.as_bytes().to_vec().into(),
+                    Hash::new(key),
+                    key.len() as u64,
+                )
+                .await
+        };
+        for key in ["ape", "bee", "cat"] {
+            write(key).await?;
+        }
+        let held = |handle: &SyncHandle, key: &'static str| {
+            let handle = handle.clone();
+            async move {
+                anyhow::Ok(
+                    handle
+                        .get_exact(ns, author, key.as_bytes().to_vec().into(), false)
+                        .await?
+                        .is_some(),
+                )
+            }
+        };
+
+        // Session setup, then a write: the actor serves the snapshot it
+        // registered, on the initial message and on every round after it.
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        write("dog").await?;
+
+        let (alice_state, bob_state, _) = exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+
+        // The mid-session write was not even transmitted.
+        assert_eq!(alice_state.num_sent, 3);
+        assert_eq!(bob_state.num_recv, 3);
+        for key in ["ape", "bee", "cat"] {
+            assert!(held(&bob, key).await?, "{key} did not reach the peer");
+        }
+        assert!(
+            !held(&bob, "dog").await?,
+            "the mid-session write was served"
+        );
+        assert!(held(&alice, "dog").await?, "the write is held at home");
+
+        // The next session, on a fresh snapshot, carries it.
+        drop((alice_session, bob_session));
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+        assert!(held(&bob, "dog").await?, "the next session withheld it too");
+
+        // Both sides now hold the same set, which is the state the initial
+        // message speaks about: its fingerprint decides whether there is
+        // anything to exchange at all. Written to after its session starts,
+        // this side still reports itself identical to the peer, and the
+        // exchange ends on that one message.
+        drop((alice_session, bob_session));
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        write("eel").await?;
+        let (alice_state, bob_state, messages) = exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+        assert_eq!(messages, 1, "the peers disagreed about being in sync");
+        assert_eq!((alice_state.num_sent, alice_state.num_recv), (0, 0));
+        assert_eq!((bob_state.num_sent, bob_state.num_recv), (0, 0));
+        assert!(
+            !held(&bob, "eel").await?,
+            "the mid-session write was served"
+        );
+
+        drop((alice_session, bob_session));
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
 }

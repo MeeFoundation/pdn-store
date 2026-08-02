@@ -1996,6 +1996,11 @@ mod tests {
     /// A session serves the store as of session setup: a write landing
     /// mid-session is not served within the session and travels on the
     /// next one.
+    ///
+    /// The snapshot is put on the replica here rather than opened through
+    /// a handle: the subject is what the store layer does with one, and the
+    /// actor's part — looking the snapshot up and handing it over — is what
+    /// `a_session_serves_the_view_frozen_at_its_start` covers.
     async fn test_session_snapshot_freezes_egress(
         mut alice_store: Store,
         mut bob_store: Store,
@@ -2061,6 +2066,11 @@ mod tests {
     /// older remote entry loses against a newer local write the snapshot
     /// predates. Judged against the snapshot instead, the older entry
     /// would overwrite the newer one.
+    ///
+    /// The entries carry hand-picked timestamps, which is what decides the
+    /// comparison under test and what a handle's own stamping cannot supply,
+    /// so both replicas are driven directly and the snapshot is put on one
+    /// of them here.
     #[tokio::test]
     async fn test_session_snapshot_keeps_ingest_reads_live() -> Result<()> {
         let mut rng = rand::rng();
@@ -2129,6 +2139,11 @@ mod tests {
     /// A held snapshot's fingerprint does not drift under live writes,
     /// while the live view and a younger snapshot see them — snapshots
     /// and the live store read side by side.
+    ///
+    /// The subject is `StoreInstance` itself, which is why the instances
+    /// below are built by hand: two snapshots and a live view of one store
+    /// have to be readable within one test, and a session gives out one
+    /// view at a time.
     #[tokio::test]
     async fn test_session_snapshot_fingerprint_stable_under_live_writes() -> Result<()> {
         use crate::{ranger::Store as _, store::fs::StoreInstance};
@@ -2265,6 +2280,9 @@ mod tests {
     /// (`snapshot_owned` flushes): an entry inserted right before session
     /// setup is in the snapshot, and the store stays writable afterwards
     /// with the new batch invisible to the held snapshot.
+    ///
+    /// The subject is the store's own flush behaviour, so the snapshot is
+    /// taken and put on a `StoreInstance` here — no exchange is involved.
     async fn test_session_snapshot_commits_pending_write_batch(mut store: Store) -> Result<()> {
         use crate::{ranger::Store as _, store::fs::StoreInstance};
 
@@ -3236,6 +3254,11 @@ mod tests {
     /// egress snapshot, so the sender re-offers it; judged against the
     /// snapshot the refusal would name an entry the receiver holds, and
     /// the sender destroys its copy on that word.
+    ///
+    /// Both sides are driven directly: the entry both hold has to be the
+    /// same bytes on both, which needs a crafted entry rather than a local
+    /// write, and the snapshot is put on the receiver here because what the
+    /// store layer does with one is the subject.
     #[tokio::test]
     async fn a_rejection_never_names_an_entry_that_landed_after_session_setup() -> Result<()> {
         let mut rng = rand::rngs::ChaCha12Rng::seed_from_u64(1);
