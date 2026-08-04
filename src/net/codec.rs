@@ -1852,4 +1852,97 @@ mod tests {
         bob.shutdown().await?;
         Ok(())
     }
+
+    /// A session released the ordinary way is never counted as reclaimed,
+    /// even when the actor's queue falls behind.
+    ///
+    /// The reclaim pass goes by the strong count and runs before the action
+    /// of its tick, so a release message still queued would read as a
+    /// registration whose handle is gone — and the counter that is supposed
+    /// to separate a lost release from an ordinary one would count both.
+    ///
+    /// Admitted instrument: the actor is parked by a subscriber that stops
+    /// draining its bounded channel, because a release has to sit in the
+    /// queue across a reclaim pass and nothing else in the API holds the
+    /// actor still for that long.
+    #[tokio::test]
+    async fn an_ordinary_release_is_not_counted_as_reclaimed() -> Result<()> {
+        let mut rng = rand::rng();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut store = store::Store::memory();
+        store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let author = store.new_author(&mut rng)?.id();
+        let handle = SyncHandle::spawn(store, None, None, None, "node".to_string());
+        let ns = namespace.id();
+        handle.open(ns, OpenOpts::default().sync()).await?;
+
+        let (events_tx, events_rx) = async_channel::bounded(1);
+        handle.subscribe(ns, events_tx).await?;
+
+        let write = |key: &'static str| {
+            let handle = handle.clone();
+            async move {
+                handle
+                    .insert_local(
+                        ns,
+                        author,
+                        key.as_bytes().to_vec().into(),
+                        Hash::new(key),
+                        key.len() as u64,
+                    )
+                    .await
+            }
+        };
+
+        let session = handle.sync_session_start(ns).await?;
+        assert_eq!(handle.debug_session_count().await?, 1);
+
+        // The first event fills the subscriber's channel; the second parks
+        // the actor inside the action that emits it.
+        write("ape").await?;
+        let parked = tokio::task::spawn(write("bee"));
+        // Polled rather than slept on: the actor is parked once it stops
+        // answering, and the probe that goes unanswered stays in the queue,
+        // which is what puts a tick between the unparking and the release.
+        let mut is_parked = false;
+        for _ in 0..50 {
+            let probe = handle.clone();
+            if tokio::time::timeout(std::time::Duration::from_millis(100), async move {
+                probe.debug_session_count().await
+            })
+            .await
+            .is_err()
+            {
+                is_parked = true;
+                break;
+            }
+        }
+        assert!(
+            is_parked,
+            "the actor was expected to park on the subscriber that stopped draining"
+        );
+
+        // Released the ordinary way, into a queue the actor is not reading.
+        drop(session);
+
+        // Long enough that the next tick's reclaim pass is due rather than
+        // held off by its own rate limit.
+        tokio::time::sleep(crate::actor::MAX_COMMIT_DELAY * 3).await;
+
+        // Draining lets the actor go: it finishes the parked action, ticks
+        // for the probe above — reclaiming as it starts that tick — and only
+        // then reads the release.
+        while events_rx.try_recv().is_ok() {}
+        parked.await??;
+        assert_eq!(handle.debug_session_count().await?, 0);
+        assert_eq!(
+            handle.metrics().sync_sessions_reclaimed.get(),
+            0,
+            "an ordinary release was counted as a lost one"
+        );
+
+        handle.shutdown().await?;
+        Ok(())
+    }
 }

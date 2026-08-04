@@ -99,7 +99,15 @@ enum Action {
     /// a replica: releasing needs no open replica, and a late release after
     /// the replica closed is a no-op either way.
     #[display("SyncSessionEnd")]
-    SyncSessionEnd { session: SyncSessionId },
+    SyncSessionEnd {
+        session: SyncSessionId,
+        /// The handle's own strong reference, riding along: the reclaim
+        /// pass goes by the strong count, and a message waiting in the
+        /// queue would otherwise read as a registration whose handle is
+        /// gone for good.
+        #[debug("alive")]
+        alive: Arc<()>,
+    },
     #[display("Shutdown")]
     Shutdown {
         #[debug("reply")]
@@ -276,11 +284,13 @@ pub struct SyncSessionId {
 /// every session exit path — success, error, and cancellation alike.
 ///
 /// The handle's liveness, not the release message, is what the actor goes
-/// by. `alive` is the only strong reference to its registration, so an
-/// entry outlives its handle no longer than the actor's next tick, whether
-/// the message was lost to a full queue or the handle was never built at
-/// all — a caller cancelled between registration and reply leaves the
-/// reference in the undelivered reply. The message is the prompt path.
+/// by, and the strong references to a registration are this handle plus a
+/// release message of its own still in the queue. An entry therefore
+/// outlives both by no more than the actor's next tick, whether the message
+/// was lost to a full queue or the handle was never built at all — a caller
+/// cancelled between registration and reply leaves the reference in the
+/// undelivered reply. The message is the prompt path; counting a queued one
+/// as lost would make the reclaim metric fire on ordinary exchanges.
 #[must_use = "dropping the handle ends the session and releases its snapshot"]
 #[derive(Debug)]
 pub struct SyncSession {
@@ -306,9 +316,13 @@ impl SyncSession {
 
 impl Drop for SyncSession {
     fn drop(&mut self) {
-        let _ = self
-            .tx
-            .try_send(Action::SyncSessionEnd { session: self.id });
+        let _ = self.tx.try_send(Action::SyncSessionEnd {
+            session: self.id,
+            // Cloning here is sound because a `Drop` body runs before
+            // the fields it drops: this is a second strong reference,
+            // not the last one resurrected.
+            alive: Arc::clone(&self._alive),
+        });
     }
 }
 
@@ -318,9 +332,10 @@ struct SessionSnapshot {
     namespace: NamespaceId,
     #[debug("ReadOnlyTables")]
     tables: ReadOnlyTables,
-    /// Weak counterpart of the handle's strong reference: once it holds
-    /// nothing, no handle can name this snapshot again and the actor
-    /// reclaims it on its next tick.
+    /// Weak counterpart of the strong references — the handle, and a
+    /// release message of its own still in the queue. Once it holds
+    /// nothing, neither exists, no handle can name this snapshot again,
+    /// and the actor reclaims it on its next tick.
     alive: Weak<()>,
 }
 
@@ -976,8 +991,11 @@ impl Actor {
                 send_reply_with(reply, self, |this| this.store.content_hashes())
             }
             Action::FlushStore { reply } => send_reply(reply, self.store.flush()),
-            Action::SyncSessionEnd { session } => {
+            Action::SyncSessionEnd { session, alive } => {
                 self.sessions.remove(&session);
+                // Kept the registration out of the reclaim pass while this
+                // message queued; with the entry gone its work is done.
+                drop(alive);
                 self.record_open_sessions();
                 Ok(())
             }
