@@ -1748,4 +1748,108 @@ mod tests {
         bob.shutdown().await?;
         Ok(())
     }
+
+    /// A retraction that lands inside a session is served for the rest of
+    /// it, and no later session takes it back.
+    ///
+    /// A removal replicates as absence, so the next session carries no news
+    /// of it: the peer keeps what it was handed and offers it back. What
+    /// removes it at the peer is the marker the retraction records above
+    /// this layer, which arms the peer to refuse the entry — reconciliation
+    /// alone converges on what a set gains, not on what it loses.
+    #[tokio::test]
+    async fn a_retraction_inside_a_session_is_served_for_the_rest_of_it() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+
+        let mut alice_store = store::Store::memory();
+        alice_store.new_replica(namespace.clone())?;
+        alice_store.close_replica(ns);
+        let author = alice_store.new_author(&mut rng)?.id();
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        bob.open(ns, OpenOpts::default().sync()).await?;
+        for key in ["ape", "bee", "cat"] {
+            alice
+                .insert_local(
+                    ns,
+                    author,
+                    key.as_bytes().to_vec().into(),
+                    Hash::new(key),
+                    key.len() as u64,
+                )
+                .await?;
+        }
+        let held = |handle: &SyncHandle, key: &'static str| {
+            let handle = handle.clone();
+            async move {
+                anyhow::Ok(
+                    handle
+                        .get_exact(ns, author, key.as_bytes().to_vec().into(), false)
+                        .await?
+                        .is_some(),
+                )
+            }
+        };
+
+        // The session's view is taken here; the retraction lands after it.
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        assert!(
+            alice
+                .retract_entry(ns, author, b"bee".to_vec().into(), u64::MAX)
+                .await?,
+            "the entry was not retracted"
+        );
+        assert!(
+            !held(&alice, "bee").await?,
+            "the row is gone from the store"
+        );
+
+        exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+        assert!(
+            held(&bob, "bee").await?,
+            "the frozen view was expected to serve the retracted entry"
+        );
+
+        // The next session carries no news of the removal — only the
+        // absence of what was removed, which the peer reads as a set this
+        // side is behind on.
+        drop((alice_session, bob_session));
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+        assert!(held(&bob, "bee").await?, "the peer still holds it");
+        assert!(
+            held(&alice, "bee").await?,
+            "and hands it back, which is what the marker above this layer refuses"
+        );
+
+        drop((alice_session, bob_session));
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
 }
