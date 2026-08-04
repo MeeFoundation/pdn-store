@@ -195,15 +195,16 @@ where
 
 /// State for the receiver side of the sync protocol.
 pub struct BobState {
-    /// The namespace of an allowed request, set at the accept decision.
-    /// Present without a session for the moment between the decision and
-    /// the session opening, which is why the two are separate fields: an
-    /// error in that moment still has to name the namespace.
+    /// The namespace the peer named in its Init, set before the accept
+    /// decision. Present without a session for the whole span from that
+    /// point to the session opening, which is why the two are separate
+    /// fields: every error in that span still has to name the namespace.
     namespace: Option<NamespaceId>,
     peer: PublicKey,
-    /// What the rounds that completed accumulated. A round that fails
-    /// leaves its own counts in the actor, and the outcome of a failed
-    /// exchange is not read.
+    /// What the rounds that completed accumulated, readable after a failed
+    /// round too: a round hands the actor a copy and keeps this one, so a
+    /// failure inside the actor loses that round's own counts and nothing
+    /// else.
     progress: SyncOutcome,
     /// This side's egress filter for the session, taken from the accept
     /// decision and frozen for the session.
@@ -232,6 +233,10 @@ impl BobState {
     }
 
     /// Handle connection and run to end.
+    ///
+    /// An exchange that ends badly says so with a terminal frame: closing
+    /// the stream is what a finished one does, and the initiator cannot
+    /// tell the two apart from the wire alone.
     pub async fn run<R, W, F, Fut>(
         &mut self,
         writer: W,
@@ -247,6 +252,43 @@ impl BobState {
     {
         let mut reader = FramedRead::new(reader, SyncCodec);
         let mut writer = FramedWrite::new(writer, SyncCodec);
+
+        let res = self
+            .run_rounds(&mut writer, &mut reader, sync, accept_cb)
+            .await;
+        if let Err(ref err) = res {
+            // Closing the stream is how a finished exchange ends, so an error
+            // that only closes it reads to the initiator as an exchange that
+            // carried nothing — and a caller waiting to catch up takes that
+            // for having caught up. The refusal branch sends its own frame.
+            if !matches!(err, AcceptError::Abort { .. }) {
+                // Best effort: the peer being gone is the ordinary reason to
+                // be on this path, and the write failing here must not
+                // replace an error that names the namespace.
+                let _ = writer
+                    .send(Message::Abort {
+                        reason: AbortReason::InternalServerError,
+                    })
+                    .await;
+            }
+        }
+        res
+    }
+
+    /// The exchange itself: init, then rounds until either side is done.
+    async fn run_rounds<R, W, F, Fut>(
+        &mut self,
+        writer: &mut FramedWrite<W, SyncCodec>,
+        reader: &mut FramedRead<R, SyncCodec>,
+        sync: SyncHandle,
+        accept_cb: F,
+    ) -> Result<NamespaceId, AcceptError>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+        F: Fn(NamespaceId, PublicKey) -> Fut,
+        Fut: Future<Output = AcceptOutcome>,
+    {
         while let Some(msg) = reader.next().await {
             let msg = msg.map_err(|e| self.fail(e))?;
             // Copied out, so the arms can take `self` mutably.
@@ -256,19 +298,17 @@ impl BobState {
                     Span::current()
                         .record("namespace", tracing::field::display(&namespace.fmt_short()));
                     trace!("recv init message");
+                    // Named from the peer's Init, before the decision that
+                    // can fail: the caller registers this pair as exchanging
+                    // when it allows the request, so every error from here on
+                    // has to name the namespace or the caller is never told
+                    // the exchange ended and holds the pair until restart.
+                    self.namespace = Some(namespace);
                     let accept = accept_cb(namespace, self.peer).await;
                     match accept {
                         AcceptOutcome::Allow { filter } => {
                             trace!("allow request");
                             self.filter = filter;
-                            // Before anything that can fail, because the
-                            // accept decision is where the caller registers
-                            // this pair as exchanging. From here an error
-                            // has to name the namespace, or the caller is
-                            // never told the exchange ended and holds the
-                            // pair for good; a failure before the decision
-                            // names nothing, and rightly.
-                            self.namespace = Some(namespace);
                         }
                         AcceptOutcome::Reject(reason) => {
                             debug!(?reason, "reject request");
@@ -292,7 +332,7 @@ impl BobState {
                         .map_err(|e| self.fail(e))?;
                     let session_id = session.id();
                     self.session = Some(session);
-                    let last_progress = std::mem::take(&mut self.progress);
+                    let last_progress = self.progress.clone();
                     sync.sync_process_message(
                         namespace,
                         message,
@@ -305,7 +345,7 @@ impl BobState {
                 }
                 (Message::Sync(msg), Some((namespace, session_id))) => {
                     trace!("recv process message");
-                    let last_progress = std::mem::take(&mut self.progress);
+                    let last_progress = self.progress.clone();
                     sync.sync_process_message(
                         namespace,
                         msg,
@@ -1458,6 +1498,451 @@ mod tests {
         drop((alice_session, bob_session));
         alice.shutdown().await?;
         bob.shutdown().await?;
+        Ok(())
+    }
+
+    /// A serving side that fails after allowing the request reaches the
+    /// initiator as a failed exchange, not as one that carried nothing.
+    ///
+    /// Closing the stream is what a finished exchange does, so without a
+    /// terminal frame the two are the same on the wire — and a caller
+    /// waiting to catch up reads the second as having caught up.
+    #[tokio::test]
+    async fn an_accept_side_failure_reaches_the_initiator_as_a_failure() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+
+        let (alice, _) = spawn_handle_with_replica(&namespace, "alice")?;
+        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        // Open, but not for sync: the request is allowed and the session
+        // then refuses — the race a newcomer hits when it dials an inviter
+        // that has not enabled sync yet.
+        bob.open(ns, OpenOpts::default()).await?;
+
+        let (alice_io, bob_io) = tokio::io::duplex(1024);
+        let (mut alice_reader, mut alice_writer) = tokio::io::split(alice_io);
+        let alice_run = alice.clone();
+        let alice_task = tokio::task::spawn(async move {
+            run_alice(
+                &mut alice_writer,
+                &mut alice_reader,
+                &alice_run,
+                ns,
+                bob_peer,
+                None,
+            )
+            .await
+        });
+        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_io);
+        let bob_run = bob.clone();
+        let bob_task = tokio::task::spawn(async move {
+            run_bob(
+                &mut bob_writer,
+                &mut bob_reader,
+                bob_run,
+                |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+                alice_peer,
+            )
+            .await
+        });
+
+        let bob_res = bob_task.await?;
+        let alice_res = alice_task.await?;
+        assert!(bob_res.is_err(), "the serving side was expected to fail");
+        assert!(
+            alice_res.is_err(),
+            "the initiator recorded a failed exchange as a successful one"
+        );
+
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
+
+    /// The outcome a failed exchange leaves behind is what its completed
+    /// rounds accumulated, not zero.
+    ///
+    /// A round hands its counts to the actor, so a round that fails there
+    /// must not take the earlier ones with it: the first thing anyone reads
+    /// on this path is how much a cut exchange had moved.
+    #[tokio::test]
+    async fn a_failed_round_keeps_what_completed_rounds_accumulated() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+
+        // Bob serves three entries and alice holds none, so bob's first
+        // round is the one that moves them.
+        let mut bob_store = store::Store::memory();
+        bob_store.new_replica(namespace.clone())?;
+        bob_store.close_replica(ns);
+        let author = bob_store.new_author(&mut rng)?.id();
+        let bob = SyncHandle::spawn(bob_store, None, None, None, "bob".to_string());
+        bob.open(ns, OpenOpts::default().sync()).await?;
+        for key in ["ape", "bee", "cat"] {
+            bob.insert_local(
+                ns,
+                author,
+                key.as_bytes().to_vec().into(),
+                Hash::new(key),
+                key.len() as u64,
+            )
+            .await?;
+        }
+        // Alice holds three of her own, so she answers bob's first round
+        // instead of ending the exchange there.
+        let mut alice_store = store::Store::memory();
+        alice_store.new_replica(namespace.clone())?;
+        alice_store.close_replica(ns);
+        let alice_author = alice_store.new_author(&mut rng)?.id();
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        for key in ["dog", "eel", "fox"] {
+            alice
+                .insert_local(
+                    ns,
+                    alice_author,
+                    key.as_bytes().to_vec().into(),
+                    Hash::new(key),
+                    key.len() as u64,
+                )
+                .await?;
+        }
+
+        let (alice_io, bob_io) = tokio::io::duplex(1024);
+        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_io);
+        let mut state = BobState::new(alice_peer);
+        let bob_run = bob.clone();
+        let bob_fut = state.run(
+            &mut bob_writer,
+            &mut bob_reader,
+            bob_run,
+            |_namespace, _peer| std::future::ready(AcceptOutcome::Allow { filter: None }),
+        );
+
+        let drive_alice = async {
+            let (alice_reader, alice_writer) = tokio::io::split(alice_io);
+            let mut reader = FramedRead::new(alice_reader, SyncCodec);
+            let mut writer = FramedWrite::new(alice_writer, SyncCodec);
+            let session = alice.sync_session_start(ns).await?;
+            let message = alice.sync_initial_message(ns, session.id(), None).await?;
+            writer
+                .send(super::Message::Init {
+                    namespace: ns,
+                    message,
+                })
+                .await?;
+
+            let reply = reader
+                .next()
+                .await
+                .transpose()?
+                .ok_or_else(|| anyhow!("the serving side answered nothing"))?;
+            let super::Message::Sync(reply) = reply else {
+                anyhow::bail!("expected a sync message, got {reply:?}");
+            };
+
+            // The replica goes away under the live session, so the next
+            // round fails inside the actor — which is where a round's own
+            // counts live while it runs.
+            bob.close(ns).await?;
+
+            let (next, _) = alice
+                .sync_process_message(
+                    ns,
+                    reply,
+                    *alice_peer.as_bytes(),
+                    SyncOutcome::default(),
+                    session.id(),
+                    None,
+                )
+                .await?;
+            let next = next.ok_or_else(|| anyhow!("the exchange ended in one round"))?;
+            writer.send(super::Message::Sync(next)).await?;
+            anyhow::Ok(())
+        };
+
+        let (bob_res, alice_res) = tokio::join!(bob_fut, drive_alice);
+        alice_res?;
+        assert!(bob_res.is_err(), "the round was expected to fail");
+        let outcome = state.into_outcome();
+        // How many the first round moves is a property of how the
+        // reconciliation splits the range; that the count is not zero after
+        // the second round failed is the property under test.
+        assert!(
+            outcome.num_sent > 0,
+            "the completed round's counts went down with the failed round"
+        );
+
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
+
+    /// A refusal that cannot be written still names the namespace.
+    ///
+    /// The caller registers the pair as exchanging when it allows the
+    /// request, and releases it by the namespace the error names. An error
+    /// without one is routed as a failure before the first message, and the
+    /// pair stays registered — no sync with that peer over that namespace
+    /// until the process restarts.
+    #[tokio::test]
+    async fn a_refusal_that_cannot_be_written_still_names_the_namespace() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+
+        let (alice, _) = spawn_handle_with_replica(&namespace, "alice")?;
+        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        bob.open(ns, OpenOpts::default().sync()).await?;
+
+        let (alice_io, bob_io) = tokio::io::duplex(1024);
+        let (mut bob_reader, mut bob_writer) = tokio::io::split(bob_io);
+
+        let session = alice.sync_session_start(ns).await?;
+        let message = alice.sync_initial_message(ns, session.id(), None).await?;
+        let mut alice_framed = FramedWrite::new(alice_io, SyncCodec);
+        alice_framed
+            .send(super::Message::Init {
+                namespace: ns,
+                message,
+            })
+            .await?;
+
+        // Dropping alice's end inside the decision puts her vanishing
+        // exactly between the peer naming the namespace and the write of
+        // the refusal, which is the window the naming has to survive.
+        let alice_end = std::sync::Arc::new(std::sync::Mutex::new(Some(alice_framed)));
+        let accept_cb = {
+            let alice_end = std::sync::Arc::clone(&alice_end);
+            move |_namespace, _peer| {
+                alice_end.lock().unwrap().take();
+                std::future::ready(AcceptOutcome::Reject(AbortReason::NotFound))
+            }
+        };
+
+        let err = run_bob(
+            &mut bob_writer,
+            &mut bob_reader,
+            bob.clone(),
+            accept_cb,
+            alice_peer,
+        )
+        .await
+        .expect_err("the refusal could not be written");
+        assert_eq!(
+            err.namespace(),
+            Some(ns),
+            "the error names no namespace, so the pair is never released"
+        );
+
+        drop(session);
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
+
+    /// A retraction that lands inside a session is served for the rest of
+    /// it, and no later session takes it back.
+    ///
+    /// A removal replicates as absence, so the next session carries no news
+    /// of it: the peer keeps what it was handed and offers it back. What
+    /// removes it at the peer is the marker the retraction records above
+    /// this layer, which arms the peer to refuse the entry — reconciliation
+    /// alone converges on what a set gains, not on what it loses.
+    #[tokio::test]
+    async fn a_retraction_inside_a_session_is_served_for_the_rest_of_it() -> Result<()> {
+        let mut rng = rand::rng();
+        let alice_peer = SecretKey::from_bytes(&[1u8; 32]).public();
+        let bob_peer = SecretKey::from_bytes(&[2u8; 32]).public();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let ns = namespace.id();
+
+        let mut alice_store = store::Store::memory();
+        alice_store.new_replica(namespace.clone())?;
+        alice_store.close_replica(ns);
+        let author = alice_store.new_author(&mut rng)?.id();
+        let alice = SyncHandle::spawn(alice_store, None, None, None, "alice".to_string());
+        let (bob, _) = spawn_handle_with_replica(&namespace, "bob")?;
+        alice.open(ns, OpenOpts::default().sync()).await?;
+        bob.open(ns, OpenOpts::default().sync()).await?;
+        for key in ["ape", "bee", "cat"] {
+            alice
+                .insert_local(
+                    ns,
+                    author,
+                    key.as_bytes().to_vec().into(),
+                    Hash::new(key),
+                    key.len() as u64,
+                )
+                .await?;
+        }
+        let held = |handle: &SyncHandle, key: &'static str| {
+            let handle = handle.clone();
+            async move {
+                anyhow::Ok(
+                    handle
+                        .get_exact(ns, author, key.as_bytes().to_vec().into(), false)
+                        .await?
+                        .is_some(),
+                )
+            }
+        };
+
+        // The session's view is taken here; the retraction lands after it.
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        assert!(
+            alice
+                .retract_entry(ns, author, b"bee".to_vec().into(), u64::MAX)
+                .await?,
+            "the entry was not retracted"
+        );
+        assert!(
+            !held(&alice, "bee").await?,
+            "the row is gone from the store"
+        );
+
+        exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+        assert!(
+            held(&bob, "bee").await?,
+            "the frozen view was expected to serve the retracted entry"
+        );
+
+        // The next session carries no news of the removal — only the
+        // absence of what was removed, which the peer reads as a set this
+        // side is behind on.
+        drop((alice_session, bob_session));
+        let alice_session = alice.sync_session_start(ns).await?;
+        let bob_session = bob.sync_session_start(ns).await?;
+        exchange_over_sessions(
+            &alice,
+            &alice_session,
+            alice_peer,
+            &bob,
+            &bob_session,
+            bob_peer,
+            ns,
+        )
+        .await?;
+        assert!(held(&bob, "bee").await?, "the peer still holds it");
+        assert!(
+            held(&alice, "bee").await?,
+            "and hands it back, which is what the marker above this layer refuses"
+        );
+
+        drop((alice_session, bob_session));
+        alice.shutdown().await?;
+        bob.shutdown().await?;
+        Ok(())
+    }
+
+    /// A session released the ordinary way is never counted as reclaimed,
+    /// even when the actor's queue falls behind.
+    ///
+    /// The reclaim pass goes by the strong count and runs before the action
+    /// of its tick, so a release message still queued would read as a
+    /// registration whose handle is gone — and the counter that is supposed
+    /// to separate a lost release from an ordinary one would count both.
+    ///
+    /// Admitted instrument: the actor is parked by a subscriber that stops
+    /// draining its bounded channel, because a release has to sit in the
+    /// queue across a reclaim pass and nothing else in the API holds the
+    /// actor still for that long.
+    #[tokio::test]
+    async fn an_ordinary_release_is_not_counted_as_reclaimed() -> Result<()> {
+        let mut rng = rand::rng();
+        let namespace = NamespaceSecret::new(&mut rng);
+        let mut store = store::Store::memory();
+        store.new_replica(namespace.clone())?;
+        store.close_replica(namespace.id());
+        let author = store.new_author(&mut rng)?.id();
+        let handle = SyncHandle::spawn(store, None, None, None, "node".to_string());
+        let ns = namespace.id();
+        handle.open(ns, OpenOpts::default().sync()).await?;
+
+        let (events_tx, events_rx) = async_channel::bounded(1);
+        handle.subscribe(ns, events_tx).await?;
+
+        let write = |key: &'static str| {
+            let handle = handle.clone();
+            async move {
+                handle
+                    .insert_local(
+                        ns,
+                        author,
+                        key.as_bytes().to_vec().into(),
+                        Hash::new(key),
+                        key.len() as u64,
+                    )
+                    .await
+            }
+        };
+
+        let session = handle.sync_session_start(ns).await?;
+        assert_eq!(handle.debug_session_count().await?, 1);
+
+        // The first event fills the subscriber's channel; the second parks
+        // the actor inside the action that emits it.
+        write("ape").await?;
+        let parked = tokio::task::spawn(write("bee"));
+        // Polled rather than slept on: the actor is parked once it stops
+        // answering, and the probe that goes unanswered stays in the queue,
+        // which is what puts a tick between the unparking and the release.
+        let mut is_parked = false;
+        for _ in 0..50 {
+            let probe = handle.clone();
+            if tokio::time::timeout(std::time::Duration::from_millis(100), async move {
+                probe.debug_session_count().await
+            })
+            .await
+            .is_err()
+            {
+                is_parked = true;
+                break;
+            }
+        }
+        assert!(
+            is_parked,
+            "the actor was expected to park on the subscriber that stopped draining"
+        );
+
+        // Released the ordinary way, into a queue the actor is not reading.
+        drop(session);
+
+        // Long enough that the next tick's reclaim pass is due rather than
+        // held off by its own rate limit.
+        tokio::time::sleep(crate::actor::MAX_COMMIT_DELAY * 3).await;
+
+        // Draining lets the actor go: it finishes the parked action, ticks
+        // for the probe above — reclaiming as it starts that tick — and only
+        // then reads the release.
+        while events_rx.try_recv().is_ok() {}
+        parked.await??;
+        assert_eq!(handle.debug_session_count().await?, 0);
+        assert_eq!(
+            handle.metrics().sync_sessions_reclaimed.get(),
+            0,
+            "an ordinary release was counted as a lost one"
+        );
+
+        handle.shutdown().await?;
         Ok(())
     }
 }
