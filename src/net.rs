@@ -210,20 +210,14 @@ where
     // A timeout has to name the namespace to release the pair the accept
     // decision registered as running — an error without one is routed as a
     // failure before the first message and leaves the pair running for
-    // good. Before that decision there is nothing registered to name.
+    // good. Named when the decision is asked for rather than when it comes
+    // back, because the bound can be reached while it is still running.
     let accepted: Arc<OnceLock<NamespaceId>> = Default::default();
     let observed_accept_cb = {
         let accepted = Arc::clone(&accepted);
         move |namespace, peer| {
-            let accepted = Arc::clone(&accepted);
-            let decision = accept_cb(namespace, peer);
-            async move {
-                let outcome = decision.await;
-                if matches!(outcome, AcceptOutcome::Allow { .. }) {
-                    let _ = accepted.set(namespace);
-                }
-                outcome
-            }
+            let _ = accepted.set(namespace);
+            accept_cb(namespace, peer)
         }
     };
 
@@ -282,17 +276,26 @@ where
     let namespace = state.namespace();
     let outcome = state.into_outcome();
 
-    send_stream
-        .finish()
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
-    send_stream
-        .stopped()
-        .await
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
-    recv_stream
-        .read_to_end(0)
-        .await
-        .map_err(|error| AcceptError::close(peer, namespace, error))?;
+    // The exchange's own result wins: teardown fails as a consequence of
+    // whatever ended the exchange, so reporting the consequence buries the
+    // cause the caller routes on. Nothing after the rounds may replace the
+    // first error — the serving side's terminal frame swallows its own for
+    // the same reason.
+    let closed: Result<(), AcceptError> = async {
+        send_stream
+            .finish()
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        send_stream
+            .stopped()
+            .await
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        recv_stream
+            .read_to_end(0)
+            .await
+            .map_err(|error| AcceptError::close(peer, namespace, error))?;
+        Ok(())
+    }
+    .await;
 
     let t_process = t_start.elapsed() - t_connect;
     span.in_scope(|| match &res {
@@ -310,7 +313,7 @@ where
         }
     });
 
-    let namespace = res?;
+    let namespace = res.and_then(|namespace| closed.map(|()| namespace))?;
 
     let timings = Timings {
         connect: t_connect,

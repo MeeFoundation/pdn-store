@@ -201,8 +201,11 @@ impl PeerState {
                 }
                 Some(*start)
             }
+            // An error can name a namespace whose pair was never registered:
+            // the peer named it in its Init and the request failed before
+            // the decision that registers. Nothing to release.
             SyncState::Idle => {
-                warn!("sync state finish called but not in running state");
+                debug!("finish called for a pair that is not running");
                 None
             }
         };
