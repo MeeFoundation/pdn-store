@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["SessionAccess","SessionRole"],"type":["EntryFilter","SessionAccessFuture","SessionAccessProvider"]};
